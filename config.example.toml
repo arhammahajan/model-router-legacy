@@ -1,0 +1,158 @@
+# Example configuration for model_router.py.
+#
+# Copy to router.toml (the default lookup name) and edit.
+# Every string supports ${ENV_VAR} expansion. The router also auto-loads
+# ~/.config/ai/credentials.env (or $XDG_CONFIG_HOME/ai/credentials.env) before
+# reading this file; existing environment variables win.
+
+[server]
+host = "127.0.0.1"
+port = 4000
+
+# Optional. When non-empty, clients must send one of these as
+# "Authorization: Bearer <key>", "x-api-key: <key>" or "api-key: <key>".
+# Empty strings (for example from an unset ${VAR}) are ignored.
+api_keys = ["${MODEL_ROUTER_API_KEY}"]
+
+# Optional request body limit, applied both before and after decompression.
+max_body_bytes = 67108864
+
+# Bound admission before starting handlers; overloaded work gets HTTP 503.
+max_connections = 32
+max_generations = 8             # positive, <= max_connections; no waiting queue
+header_read_timeout = 10        # absolute seconds for request line + headers
+body_read_timeout = 30          # absolute seconds for body + chunk framing
+write_timeout = 30              # seconds per downstream write, not stream duration
+# Provider timeout independently controls upstream generation/read waits.
+
+# ---------------------------------------------------------------------------
+# Providers: one entry per upstream endpoint.
+#
+# dialect is what the upstream speaks:
+#   "openai-chat"      -> POST <base_url>/chat/completions
+#   "openai-responses" -> POST <base_url>/responses
+#   "anthropic"        -> POST <base_url>/v1/messages
+#   "gemini"           -> LiteLLM's Gemini protocol (generateContent)
+#
+# For OpenAI dialects, include the version path in base_url (usually /v1).
+# For Anthropic, use the origin (https://api.anthropic.com) or a prefix; LiteLLM
+# appends /v1/messages. A base_url ending in /v1/messages is also accepted.
+# For Gemini, include /v1beta in base_url.
+#
+# Credential isolation: a nonempty api_key/api_key_env/api_key_file selects that
+# key, with surrounding whitespace stripped. Missing/empty keys intentionally
+# send the public "model-router-no-auth" placeholder in both passthrough and
+# translated requests; unauthenticated servers must accept/ignore it. Ambient
+# environment/global LiteLLM keys never act as fallbacks. Use api_key_env for
+# environment references (LiteLLM's os.environ/NAME indirection is rejected).
+# The top-level key takes precedence over duplicates in litellm_kwargs.
+#
+# auth_header (optional): "bearer", "x-api-key", or "api-key" to force how the
+#   upstream key is sent. Empty leaves the provider default.
+# session_header (optional): header to carry a per-request session id. If the
+#   client does not send it, the router generates one (or reuses
+#   prompt_cache_key). Useful for OpenCode Go.
+# ---------------------------------------------------------------------------
+
+[providers.anthropic]
+dialect = "anthropic"
+base_url = "https://api.anthropic.com"
+api_key_env = "ANTHROPIC_API_KEY"
+# headers = { "anthropic-beta" = "some-beta-flag" }
+# timeout = 600
+
+[providers.openai]
+dialect = "openai-responses"
+base_url = "https://api.openai.com/v1"
+api_key_env = "OPENAI_API_KEY"
+
+# Any OpenAI-compatible server: vLLM, Ollama, LM Studio, OpenRouter, a gateway.
+[providers.local]
+dialect = "openai-chat"
+base_url = "http://127.0.0.1:11434/v1"
+api_key = "ollama"
+
+# A second OpenAI endpoint that speaks Chat Completions.
+# [providers.openrouter]
+# dialect = "openai-chat"
+# base_url = "https://openrouter.ai/api/v1"
+# api_key_env = "OPENROUTER_API_KEY"
+# headers = { "HTTP-Referer" = "http://localhost", "X-Title" = "model-router" }
+
+# ---------------------------------------------------------------------------
+# Dynamic catalog (optional). Fetches model IDs from an OpenAI-style /v1/models
+# endpoint at startup (and every refresh_seconds) and exposes them under their
+# upstream IDs. Rules are regexes matched against each model ID; first match
+# wins. A config may have catalog rules, explicit [[models]], or both.
+# See router.toml for the OpenCode Go setup.
+# ---------------------------------------------------------------------------
+# [catalog]
+# url = "https://opencode.ai/inference/go/v1/models"
+# refresh_seconds = 300
+#
+# [[catalog.rules]]
+# match = "^claude-"
+# provider = "anthropic"
+#
+# [[catalog.rules]]
+# match = "."
+# provider = "openai"
+
+# ---------------------------------------------------------------------------
+# Automatic llama.cpp discovery (optional).
+#
+# Every server is probed at startup and every refresh_seconds. Models, aliases,
+# context size and capabilities are read from /health, /v1/models and /props.
+# Single-model, router (--models-preset), legacy (ik_llama.cpp) and llama-swap
+# servers are all recognized. Discovered models become ordinary routes on
+# llama.cpp's OpenAI Chat endpoint, and are translated for other ingresses.
+#
+# A config may consist only of [llama_cpp]. If "servers" and "ports" are both
+# omitted, LLAMA_SERVER_URL (semicolon/comma separated) is used, then
+# http://127.0.0.1:9931.
+# ---------------------------------------------------------------------------
+# [llama_cpp]
+# servers = ["http://127.0.0.1:9931"]
+# # Or scan fixed localhost ports:
+# # ports = [9931, 8080]
+# # Per-server name, key and headers:
+# # servers = [{ url = "http://127.0.0.1:8080", name = "local", api_key_env = "LLAMA_API_KEY" }]
+#
+# refresh_seconds = 30        # 0 = startup only
+# timeout = 2                 # per-probe timeout
+# context_fallback = 128000   # used when the server reports no context size
+# prefix = ""                 # e.g. "llama/" to namespace discovered models
+# aliases = true              # expose llama.cpp model aliases as routes
+# api_key_env = "LLAMA_API_KEY"  # usually unnecessary for localhost
+# headers = { "User-Agent" = "litellm-model-router/0.3.0" }
+
+# ---------------------------------------------------------------------------
+# Models: the public names clients send. Provider dialect can be overridden per
+# route if one endpoint exposes both protocols. "aliases" are additional names.
+# ---------------------------------------------------------------------------
+
+[[models]]
+name = "claude-sonnet"
+provider = "anthropic"
+model = "claude-sonnet-4-5-20250929"
+aliases = ["claude", "anthropic/claude-sonnet-4-5"]
+metadata = { display_name = "Claude Sonnet 4.5", context_window = 200000 }
+
+[[models]]
+name = "claude-haiku"
+provider = "anthropic"
+model = "claude-haiku-4-5-20250929"
+
+[[models]]
+name = "gpt-5"
+provider = "openai"
+model = "gpt-5"
+
+[[models]]
+name = "local-llama"
+provider = "local"
+model = "llama3.1"
+
+# If a request names an unlisted model as "provider/model-id", the router sends
+# it to that provider using the provider's default dialect. For example:
+#   model = "local/qwen2.5-coder:7b"

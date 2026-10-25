@@ -1,0 +1,82 @@
+# OpenCode Go router.
+#
+# Credentials are auto-loaded from ~/.config/ai/credentials.env, so
+# OPENCODE_API_KEY does not need to be exported in the shell.
+#
+#   .venv/bin/python model_router.py
+#
+# Clients use http://127.0.0.1:4000/v1 with any placeholder API key.
+
+[server]
+host = "127.0.0.1"
+port = 4000
+# Optional client-side auth for this router. Empty values are ignored.
+api_keys = ["${MODEL_ROUTER_API_KEY}"]
+max_body_bytes = 67108864
+
+# Bound admission before starting handlers; overloaded work gets HTTP 503.
+max_connections = 32
+max_generations = 8             # positive, <= max_connections; no waiting queue
+header_read_timeout = 10        # absolute seconds for request line + headers
+body_read_timeout = 30          # absolute seconds for body + chunk framing
+write_timeout = 30              # seconds per downstream write, not stream duration
+# Provider timeout independently controls upstream generation/read waits.
+
+# OpenCode Go's /v1/models catalog is fetched at startup and refreshed every
+# five minutes. Model IDs are exposed as-is, so a client can request any model
+# listed by GET /v1/models without editing this file.
+[catalog]
+url = "https://opencode.ai/inference/go/v1/models"
+refresh_seconds = 300
+headers = { "User-Agent" = "litellm-model-router/0.2.0" }
+
+# First matching rule wins. Claude models are only served by OpenCode's
+# Anthropic endpoint; Gemini models by its Google endpoint. Everything else
+# works on the OpenAI Responses endpoint.
+[[catalog.rules]]
+match = "^claude-"
+provider = "opencode-anthropic"
+
+[[catalog.rules]]
+match = "^gemini-"
+provider = "opencode-gemini"
+
+[[catalog.rules]]
+match = "."
+provider = "opencode-openai"
+
+[providers.opencode-openai]
+dialect = "openai-responses"
+base_url = "https://opencode.ai/inference/go/openai/v1"
+api_key_env = "OPENCODE_API_KEY"
+session_header = "x-opencode-session"
+headers = { "User-Agent" = "litellm-model-router/0.3.0" }
+timeout = 600
+
+[providers.opencode-anthropic]
+dialect = "anthropic"
+base_url = "https://opencode.ai/inference/go/anthropic"
+api_key_env = "OPENCODE_API_KEY"
+auth_header = "x-api-key"
+session_header = "x-opencode-session"
+headers = { "User-Agent" = "litellm-model-router/0.3.0" }
+timeout = 600
+
+[providers.opencode-gemini]
+dialect = "gemini"
+base_url = "https://opencode.ai/inference/go/google/v1beta"
+api_key_env = "OPENCODE_API_KEY"
+auth_header = "bearer"
+session_header = "x-opencode-session"
+headers = { "User-Agent" = "litellm-model-router/0.3.0" }
+timeout = 600
+
+# Local llama.cpp / llama-swap servers are discovered automatically. Models
+# appear in /v1/models alongside the OpenCode catalog, with their context size
+# and aliases. LLAMA_SERVER_URL overrides the server list. Delete this section
+# to turn discovery off.
+[llama_cpp]
+servers = ["http://127.0.0.1:9931"]
+refresh_seconds = 30
+timeout = 1
+headers = { "User-Agent" = "litellm-model-router/0.3.0" }
