@@ -46,6 +46,12 @@ write_timeout = 30              # seconds per downstream write, not stream durat
 # environment/global LiteLLM keys never act as fallbacks. Use api_key_env for
 # environment references (LiteLLM's os.environ/NAME indirection is rejected).
 # The top-level key takes precedence over duplicates in litellm_kwargs.
+# Translation compatibility defaults to "strict": unsupported/unmapped controls
+# return HTTP 400. Explicit compatibility = "lossy" removes known losses and
+# reports x-model-router-loss on JSON/SSE responses. Legacy drop_params=true
+# selects this diagnosed lossy policy; client JSON cannot select either mode.
+# Translation forwards only destination-dialect beta/version headers. Trusted
+# provider headers override inbound opt-ins case-insensitively; auth wins last.
 #
 # auth_header (optional): "bearer", "x-api-key", or "api-key" to force how the
 #   upstream key is sent. Empty leaves the provider default.
@@ -60,6 +66,7 @@ base_url = "https://api.anthropic.com"
 api_key_env = "ANTHROPIC_API_KEY"
 # headers = { "anthropic-beta" = "some-beta-flag" }
 # timeout = 600
+# compatibility = "strict" # or explicit "lossy" with response diagnostics
 
 [providers.openai]
 dialect = "openai-responses"
@@ -81,31 +88,41 @@ api_key = "ollama"
 
 # ---------------------------------------------------------------------------
 # Dynamic catalog (optional). Fetches model IDs from an OpenAI-style /v1/models
-# endpoint at startup (and every refresh_seconds) and exposes them under their
-# upstream IDs. Rules are regexes matched against each model ID; first match
-# wins. A config may have catalog rules, explicit [[models]], or both.
-# See router.toml for the OpenCode Go setup.
+# endpoint once before listening, then in a managed background worker, exposing
+# upstream IDs. Exact model_providers entries win over optional regex rules
+# (first matching rule wins). Unmapped IDs are omitted and diagnosed, not
+# assigned a default dialect. Explicit [[models]] override catalog routes.
+# See router.toml for the reviewed OpenCode Go map and four trusted providers;
+# Go models do not all support Responses, even within a single model family.
 # ---------------------------------------------------------------------------
 # [catalog]
 # url = "https://opencode.ai/inference/go/v1/models"
-# refresh_seconds = 300
+# metadata_source = "opencode-go-v1" # frozen reviewed capabilities; no Models.dev fetch
+# refresh_seconds = 300       # 0 = exactly one startup attempt, even on failure
+# # Failures retry with jittered exponential backoff (2.5–300 seconds).
+# # Model listing, resolution and health only read cached discovery state.
 #
-# [[catalog.rules]]
-# match = "^claude-"
-# provider = "anthropic"
-#
-# [[catalog.rules]]
-# match = "."
-# provider = "openai"
+# [catalog.model_providers]
+# "claude-haiku-5-5" = "opencode-anthropic"
+# "gemini-4-argon" = "opencode-gemini"
+# "gpt-6-luna" = "opencode-openai"
+# "deepseek-v4.1-flash" = "opencode-chat"
+# "minimax-m3" = "opencode-anthropic"
+# "minimax-m3.1-flash" = "opencode-chat"
+# "qwen3.8-max" = "opencode-anthropic"
+# Values above require the [providers.opencode-*] definitions from router.toml.
 
 # ---------------------------------------------------------------------------
 # Automatic llama.cpp discovery (optional).
 #
-# Every server is probed at startup and every refresh_seconds. Models, aliases,
+# Every server is probed once before listening, then in the background. Models, aliases,
 # context size and capabilities are read from /health, /v1/models and /props.
 # Single-model, router (--models-preset), legacy (ik_llama.cpp) and llama-swap
 # servers are all recognized. Discovered models become ordinary routes on
 # llama.cpp's OpenAI Chat endpoint, and are translated for other ingresses.
+# Provider identities are reserved before probing, including unavailable servers.
+# Explicit names must be unique across servers and static providers. Generated
+# URL names use -2, -3, etc. on collision in config order, independent of health.
 #
 # A config may consist only of [llama_cpp]. If "servers" and "ports" are both
 # omitted, LLAMA_SERVER_URL (semicolon/comma separated) is used, then
@@ -118,13 +135,41 @@ api_key = "ollama"
 # # Per-server name, key and headers:
 # # servers = [{ url = "http://127.0.0.1:8080", name = "local", api_key_env = "LLAMA_API_KEY" }]
 #
-# refresh_seconds = 30        # 0 = startup only
+# refresh_seconds = 30        # 0 = exactly one startup attempt, even on failure
+# # Any failed server backs off the discovery round; successful servers update
+# # while failed servers retain their last usable routes. No on-disk cache.
 # timeout = 2                 # per-probe timeout
-# context_fallback = 128000   # used when the server reports no context size
+# context_fallback = 128000   # labeled fallback, never a measured runtime limit
 # prefix = ""                 # e.g. "llama/" to namespace discovered models
 # aliases = true              # expose llama.cpp model aliases as routes
 # api_key_env = "LLAMA_API_KEY"  # usually unnecessary for localhost
 # headers = { "User-Agent" = "litellm-model-router/0.3.0" }
+#
+# Optional reporting overrides by exact upstream model ID, before prefix/aliases.
+# Explicit overrides win over discovered reports, launch estimates and fallback.
+# They do not reconfigure/enforce server limits. Unspecified output maxima stay
+# unknown: discovered max_tokens now means max_output_tokens, not context size.
+# [llama_cpp.limit_overrides."my-model-id"]
+# context_window = 8192
+# trained_context_window = 131072
+# max_input_tokens = 8000
+# max_output_tokens = 2048
+# default_output_tokens = 256
+
+# Version 1 advisory capability overrides enrich a discovered route without
+# redeclaring its routing. Keys are canonical public IDs, INCLUDING any prefix.
+# Omit unknown fields; JSON configs can use null to withdraw a claim.
+# These are operator assertions for your verified build/template; no default
+# reasoning enum is assumed. See CAPABILITIES.md for schema and client usage.
+# [capabilities.overrides."llama/my-model-id".reasoning]
+# supported = true
+# [capabilities.overrides."llama/my-model-id".reasoning.effort]
+# supported = true
+# values = ["small", "large"] # only if established for this exact model/template
+# default = "small"
+# native_parameter = { protocol = "openai-chat", path = "reasoning_effort" }
+# [capabilities.overrides."llama/my-model-id".tools]
+# parallel = false
 
 # ---------------------------------------------------------------------------
 # Models: the public names clients send. Provider dialect can be overridden per

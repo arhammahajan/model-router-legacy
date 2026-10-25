@@ -1,0 +1,124 @@
+{
+  "source": "https://opencode.ai/v2/docs/console/go/#endpoints",
+  "reviewed_on": "2026-10-26",
+  "revision": 1,
+  "verification": "documented endpoints only; no authenticated inference verification",
+  "models": {
+    "grok-4.7": {
+      "dialect": "openai-responses",
+      "endpoint": "https://opencode.ai/inference/go/openai/v1/responses"
+    },
+    "gpt-6-luna": {
+      "dialect": "openai-responses",
+      "endpoint": "https://opencode.ai/inference/go/openai/v1/responses"
+    },
+    "gpt-5.6-luna": {
+      "dialect": "openai-responses",
+      "endpoint": "https://opencode.ai/inference/go/openai/v1/responses"
+    },
+    "claude-haiku-5-5": {
+      "dialect": "anthropic",
+      "endpoint": "https://opencode.ai/inference/go/anthropic/v1/messages"
+    },
+    "gemini-4-argon": {
+      "dialect": "gemini",
+      "endpoint": "https://opencode.ai/inference/go/google/v1beta/models/gemini-4-argon"
+    },
+    "glm-5.3-flash": {
+      "dialect": "openai-chat",
+      "endpoint": "https://opencode.ai/inference/go/openai/v1/chat/completions"
+    },
+    "glm-5.3": {
+      "dialect": "openai-chat",
+      "endpoint": "https://opencode.ai/inference/go/openai/v1/chat/completions"
+    },
+    "glm-5.2": {
+      "dialect": "openai-chat",
+      "endpoint": "https://opencode.ai/inference/go/openai/v1/chat/completions"
+    },
+    "kimi-k3.1-pro": {
+      "dialect": "openai-chat",
+      "endpoint": "https://opencode.ai/inference/go/openai/v1/chat/completions"
+    },
+    "kimi-k3": {
+      "dialect": "openai-chat",
+      "endpoint": "https://opencode.ai/inference/go/openai/v1/chat/completions"
+    },
+    "kimi-k2.7-code": {
+      "dialect": "openai-chat",
+      "endpoint": "https://opencode.ai/inference/go/openai/v1/chat/completions"
+    },
+    "longcat-2.0": {
+      "dialect": "openai-chat",
+      "endpoint": "https://opencode.ai/inference/go/openai/v1/chat/completions"
+    },
+    "deepseek-v4.1-flash": {
+      "dialect": "openai-chat",
+      "endpoint": "https://opencode.ai/inference/go/openai/v1/chat/completions"
+    },
+    "deepseek-v4-pro": {
+      "dialect": "openai-chat",
+      "endpoint": "https://opencode.ai/inference/go/openai/v1/chat/completions"
+    },
+    "mimo-v2.6-flash": {
+      "dialect": "openai-chat",
+      "endpoint": "https://opencode.ai/inference/go/openai/v1/chat/completions"
+    },
+    "mimo-v2.6-pro": {
+      "dialect": "openai-chat",
+      "endpoint": "https://opencode.ai/inference/go/openai/v1/chat/completions"
+    },
+    "mimo-v2.5": {
+      "dialect": "openai-chat",
+      "endpoint": "https://opencode.ai/inference/go/openai/v1/chat/completions"
+    },
+    "mimo-v2.5-pro": {
+      "dialect": "openai-chat",
+      "endpoint": "https://opencode.ai/inference/go/openai/v1/chat/completions"
+    },
+    "minimax-m3.1-flash": {
+      "dialect": "openai-chat",
+      "endpoint": "https://opencode.ai/inference/go/openai/v1/chat/completions"
+    },
+    "minimax-m3": {
+      "dialect": "anthropic",
+      "endpoint": "https://opencode.ai/inference/go/anthropic/v1/messages"
+    },
+    "muse-spark-1.3-contributor": {
+      "dialect": "openai-responses",
+      "endpoint": "https://opencode.ai/inference/go/openai/v1/responses"
+    },
+    "muse-spark-1.2-contributor": {
+      "dialect": "openai-responses",
+      "endpoint": "https://opencode.ai/inference/go/openai/v1/responses"
+    },
+    "qwen3.8-max": {
+      "dialect": "anthropic",
+      "endpoint": "https://opencode.ai/inference/go/anthropic/v1/messages"
+    },
+    "qwen3.8-flash": {
+      "dialect": "anthropic",
+      "endpoint": "https://opencode.ai/inference/go/anthropic/v1/messages"
+    },
+    "qwen3.7-plus": {
+      "dialect": "anthropic",
+      "endpoint": "https://opencode.ai/inference/go/anthropic/v1/messages"
+    },
+    "hy4-preview": {
+      "dialect": "openai-chat",
+      "endpoint": "https://opencode.ai/inference/go/openai/v1/chat/completions"
+    },
+    "hy3": {
+      "dialect": "openai-chat",
+      "endpoint": "https://opencode.ai/inference/go/openai/v1/chat/completions"
+    },
+    "step-5-preview": {
+      "dialect": "openai-chat",
+      "endpoint": "https://opencode.ai/inference/go/openai/v1/chat/completions"
+    },
+    "beam-free": {
+      "dialect": "openai-chat",
+      "endpoint": "https://opencode.ai/inference/go/openai/v1/chat/completions"
+    }
+  }
+}

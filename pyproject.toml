@@ -21,6 +21,10 @@ model-router = "model_router:main"
 
 [tool.setuptools]
 py-modules = ["model_router"]
+packages = ["router_metadata"]
+
+[tool.setuptools.package-data]
+router_metadata = ["*.json"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -1,0 +1,886 @@
+{
+  "schema_version": 1,
+  "revision": 1,
+  "retrieved_at": "2026-10-25T19:45:18Z",
+  "stale_after_seconds": 2592000,
+  "provenance": {
+    "source": "https://models.dev/api.json",
+    "reviewed_on": "2026-10-26",
+    "repository_revision": "205c4d569b6670625f845d018429847f5dea7e3e",
+    "snapshot_sha256": "8307a97a5bc2a5e892ce4a5af25aefc9d525a4ff3fc630d259e8087c53baf93e",
+    "verification": "reviewed provider-specific Models.dev records; not authenticated inference verification"
+  },
+  "models": {
+    "grok-4.7": {
+      "source": "https://github.com/anomalyco/models.dev/blob/205c4d569b6670625f845d018429847f5dea7e3e/providers/opencode-go/models/grok-4.7.toml",
+      "dialect": "openai-responses",
+      "facts": {
+        "reasoning.supported": true,
+        "tools.supported": true,
+        "structured_output.supported": true,
+        "sampling.temperature.supported": true,
+        "modalities.input.text": true,
+        "modalities.input.image": true,
+        "modalities.input.audio": false,
+        "modalities.input.video": false,
+        "modalities.input.pdf": true,
+        "modalities.input.embedding": false,
+        "modalities.output.text": true,
+        "modalities.output.image": false,
+        "modalities.output.audio": false,
+        "modalities.output.video": false,
+        "modalities.output.pdf": false,
+        "modalities.output.embedding": false,
+        "limits.context_window": 500000,
+        "limits.max_output_tokens": 500000,
+        "reasoning.effort.supported": true,
+        "reasoning.effort.values": [
+          "low",
+          "medium",
+          "high",
+          "xhigh"
+        ]
+      }
+    },
+    "gpt-6-luna": {
+      "source": "https://github.com/anomalyco/models.dev/blob/205c4d569b6670625f845d018429847f5dea7e3e/providers/opencode-go/models/gpt-6-luna.toml",
+      "dialect": "openai-responses",
+      "facts": {
+        "reasoning.supported": true,
+        "tools.supported": true,
+        "structured_output.supported": true,
+        "sampling.temperature.supported": false,
+        "modalities.input.text": true,
+        "modalities.input.image": true,
+        "modalities.input.audio": false,
+        "modalities.input.video": false,
+        "modalities.input.pdf": true,
+        "modalities.input.embedding": false,
+        "modalities.output.text": true,
+        "modalities.output.image": false,
+        "modalities.output.audio": false,
+        "modalities.output.video": false,
+        "modalities.output.pdf": false,
+        "modalities.output.embedding": false,
+        "limits.context_window": 1050000,
+        "limits.max_input_tokens": 922000,
+        "limits.max_output_tokens": 128000,
+        "reasoning.effort.supported": true,
+        "reasoning.effort.values": [
+          "none",
+          "low",
+          "medium",
+          "high",
+          "xhigh",
+          "max"
+        ],
+        "reasoning.effort.native_parameter": {
+          "protocol": "openai-responses",
+          "path": "reasoning.effort"
+        }
+      }
+    },
+    "gpt-5.6-luna": {
+      "source": "https://github.com/anomalyco/models.dev/blob/205c4d569b6670625f845d018429847f5dea7e3e/providers/opencode-go/models/gpt-5.6-luna.toml",
+      "dialect": "openai-responses",
+      "facts": {
+        "reasoning.supported": true,
+        "tools.supported": true,
+        "structured_output.supported": true,
+        "sampling.temperature.supported": false,
+        "modalities.input.text": true,
+        "modalities.input.image": true,
+        "modalities.input.audio": false,
+        "modalities.input.video": false,
+        "modalities.input.pdf": true,
+        "modalities.input.embedding": false,
+        "modalities.output.text": true,
+        "modalities.output.image": false,
+        "modalities.output.audio": false,
+        "modalities.output.video": false,
+        "modalities.output.pdf": false,
+        "modalities.output.embedding": false,
+        "limits.context_window": 1050000,
+        "limits.max_input_tokens": 922000,
+        "limits.max_output_tokens": 128000,
+        "reasoning.effort.supported": true,
+        "reasoning.effort.values": [
+          "none",
+          "low",
+          "medium",
+          "high",
+          "xhigh",
+          "max"
+        ]
+      }
+    },
+    "claude-haiku-5-5": {
+      "source": "https://github.com/anomalyco/models.dev/blob/205c4d569b6670625f845d018429847f5dea7e3e/providers/opencode-go/models/claude-haiku-5-5.toml",
+      "dialect": "anthropic",
+      "facts": {
+        "reasoning.supported": true,
+        "tools.supported": true,
+        "structured_output.supported": true,
+        "sampling.temperature.supported": false,
+        "modalities.input.text": true,
+        "modalities.input.image": true,
+        "modalities.input.audio": false,
+        "modalities.input.video": false,
+        "modalities.input.pdf": true,
+        "modalities.input.embedding": false,
+        "modalities.output.text": true,
+        "modalities.output.image": false,
+        "modalities.output.audio": false,
+        "modalities.output.video": false,
+        "modalities.output.pdf": false,
+        "modalities.output.embedding": false,
+        "limits.context_window": 1000000,
+        "limits.max_output_tokens": 128000,
+        "reasoning.toggle.supported": true,
+        "reasoning.effort.supported": true,
+        "reasoning.effort.values": [
+          "low",
+          "medium",
+          "high",
+          "xhigh",
+          "max"
+        ]
+      }
+    },
+    "gemini-4-argon": {
+      "source": "https://github.com/anomalyco/models.dev/blob/205c4d569b6670625f845d018429847f5dea7e3e/providers/opencode-go/models/gemini-4-argon.toml",
+      "dialect": "gemini",
+      "facts": {
+        "reasoning.supported": true,
+        "tools.supported": true,
+        "structured_output.supported": true,
+        "sampling.temperature.supported": false,
+        "modalities.input.text": true,
+        "modalities.input.image": true,
+        "modalities.input.audio": true,
+        "modalities.input.video": true,
+        "modalities.input.pdf": true,
+        "modalities.input.embedding": false,
+        "modalities.output.text": true,
+        "modalities.output.image": false,
+        "modalities.output.audio": false,
+        "modalities.output.video": false,
+        "modalities.output.pdf": false,
+        "modalities.output.embedding": false,
+        "limits.context_window": 1048576,
+        "limits.max_output_tokens": 65536,
+        "reasoning.effort.supported": true,
+        "reasoning.effort.values": [
+          "low",
+          "medium",
+          "high"
+        ]
+      }
+    },
+    "glm-5.3-flash": {
+      "source": "https://github.com/anomalyco/models.dev/blob/205c4d569b6670625f845d018429847f5dea7e3e/providers/opencode-go/models/glm-5.3-flash.toml",
+      "dialect": "openai-chat",
+      "facts": {
+        "reasoning.supported": true,
+        "tools.supported": true,
+        "structured_output.supported": true,
+        "sampling.temperature.supported": true,
+        "modalities.input.text": true,
+        "modalities.input.image": true,
+        "modalities.input.audio": false,
+        "modalities.input.video": true,
+        "modalities.input.pdf": false,
+        "modalities.input.embedding": false,
+        "modalities.output.text": true,
+        "modalities.output.image": false,
+        "modalities.output.audio": false,
+        "modalities.output.video": false,
+        "modalities.output.pdf": false,
+        "modalities.output.embedding": false,
+        "limits.context_window": 1000000,
+        "limits.max_output_tokens": 131072,
+        "reasoning.effort.supported": true,
+        "reasoning.effort.values": [
+          "low",
+          "high",
+          "max"
+        ],
+        "reasoning.effort.native_parameter": {
+          "protocol": "openai-chat",
+          "path": "reasoning_effort"
+        }
+      }
+    },
+    "glm-5.3": {
+      "source": "https://github.com/anomalyco/models.dev/blob/205c4d569b6670625f845d018429847f5dea7e3e/providers/opencode-go/models/glm-5.3.toml",
+      "dialect": "openai-chat",
+      "facts": {
+        "reasoning.supported": true,
+        "tools.supported": true,
+        "structured_output.supported": true,
+        "sampling.temperature.supported": true,
+        "modalities.input.text": true,
+        "modalities.input.image": false,
+        "modalities.input.audio": false,
+        "modalities.input.video": false,
+        "modalities.input.pdf": false,
+        "modalities.input.embedding": false,
+        "modalities.output.text": true,
+        "modalities.output.image": false,
+        "modalities.output.audio": false,
+        "modalities.output.video": false,
+        "modalities.output.pdf": false,
+        "modalities.output.embedding": false,
+        "limits.context_window": 1000000,
+        "limits.max_output_tokens": 131072,
+        "reasoning.effort.supported": true,
+        "reasoning.effort.values": [
+          "low",
+          "high",
+          "max"
+        ]
+      }
+    },
+    "glm-5.2": {
+      "source": "https://github.com/anomalyco/models.dev/blob/205c4d569b6670625f845d018429847f5dea7e3e/providers/opencode-go/models/glm-5.2.toml",
+      "dialect": "openai-chat",
+      "facts": {
+        "reasoning.supported": true,
+        "tools.supported": true,
+        "structured_output.supported": true,
+        "sampling.temperature.supported": true,
+        "modalities.input.text": true,
+        "modalities.input.image": false,
+        "modalities.input.audio": false,
+        "modalities.input.video": false,
+        "modalities.input.pdf": false,
+        "modalities.input.embedding": false,
+        "modalities.output.text": true,
+        "modalities.output.image": false,
+        "modalities.output.audio": false,
+        "modalities.output.video": false,
+        "modalities.output.pdf": false,
+        "modalities.output.embedding": false,
+        "limits.context_window": 1000000,
+        "limits.max_output_tokens": 131072,
+        "reasoning.effort.supported": true,
+        "reasoning.effort.values": [
+          "high",
+          "max"
+        ]
+      }
+    },
+    "kimi-k3.1-pro": {
+      "source": "https://github.com/anomalyco/models.dev/blob/205c4d569b6670625f845d018429847f5dea7e3e/providers/opencode-go/models/kimi-k3.1-pro.toml",
+      "dialect": "openai-chat",
+      "facts": {
+        "reasoning.supported": true,
+        "tools.supported": true,
+        "structured_output.supported": true,
+        "sampling.temperature.supported": false,
+        "modalities.input.text": true,
+        "modalities.input.image": true,
+        "modalities.input.audio": false,
+        "modalities.input.video": true,
+        "modalities.input.pdf": false,
+        "modalities.input.embedding": false,
+        "modalities.output.text": true,
+        "modalities.output.image": false,
+        "modalities.output.audio": false,
+        "modalities.output.video": false,
+        "modalities.output.pdf": false,
+        "modalities.output.embedding": false,
+        "limits.context_window": 1048576,
+        "limits.max_output_tokens": 131072,
+        "reasoning.effort.supported": true,
+        "reasoning.effort.values": [
+          "low",
+          "high",
+          "max"
+        ]
+      }
+    },
+    "kimi-k3": {
+      "source": "https://github.com/anomalyco/models.dev/blob/205c4d569b6670625f845d018429847f5dea7e3e/providers/opencode-go/models/kimi-k3.toml",
+      "dialect": "openai-chat",
+      "facts": {
+        "reasoning.supported": true,
+        "tools.supported": true,
+        "structured_output.supported": true,
+        "sampling.temperature.supported": false,
+        "modalities.input.text": true,
+        "modalities.input.image": true,
+        "modalities.input.audio": false,
+        "modalities.input.video": true,
+        "modalities.input.pdf": false,
+        "modalities.input.embedding": false,
+        "modalities.output.text": true,
+        "modalities.output.image": false,
+        "modalities.output.audio": false,
+        "modalities.output.video": false,
+        "modalities.output.pdf": false,
+        "modalities.output.embedding": false,
+        "limits.context_window": 1048576,
+        "limits.max_output_tokens": 131072,
+        "reasoning.effort.supported": true,
+        "reasoning.effort.values": [
+          "max"
+        ]
+      }
+    },
+    "kimi-k2.7-code": {
+      "source": "https://github.com/anomalyco/models.dev/blob/205c4d569b6670625f845d018429847f5dea7e3e/providers/opencode-go/models/kimi-k2.7-code.toml",
+      "dialect": "openai-chat",
+      "facts": {
+        "reasoning.supported": true,
+        "tools.supported": true,
+        "structured_output.supported": true,
+        "sampling.temperature.supported": false,
+        "modalities.input.text": true,
+        "modalities.input.image": true,
+        "modalities.input.audio": false,
+        "modalities.input.video": true,
+        "modalities.input.pdf": false,
+        "modalities.input.embedding": false,
+        "modalities.output.text": true,
+        "modalities.output.image": false,
+        "modalities.output.audio": false,
+        "modalities.output.video": false,
+        "modalities.output.pdf": false,
+        "modalities.output.embedding": false,
+        "limits.context_window": 262144,
+        "limits.max_output_tokens": 262144
+      }
+    },
+    "longcat-2.0": {
+      "source": "https://github.com/anomalyco/models.dev/blob/205c4d569b6670625f845d018429847f5dea7e3e/providers/opencode-go/models/longcat-2.0.toml",
+      "dialect": "openai-chat",
+      "facts": {
+        "reasoning.supported": true,
+        "tools.supported": true,
+        "sampling.temperature.supported": true,
+        "modalities.input.text": true,
+        "modalities.input.image": false,
+        "modalities.input.audio": false,
+        "modalities.input.video": false,
+        "modalities.input.pdf": false,
+        "modalities.input.embedding": false,
+        "modalities.output.text": true,
+        "modalities.output.image": false,
+        "modalities.output.audio": false,
+        "modalities.output.video": false,
+        "modalities.output.pdf": false,
+        "modalities.output.embedding": false,
+        "limits.context_window": 1000000,
+        "limits.max_output_tokens": 131072,
+        "reasoning.toggle.supported": true
+      }
+    },
+    "deepseek-v4.1-flash": {
+      "source": "https://github.com/anomalyco/models.dev/blob/205c4d569b6670625f845d018429847f5dea7e3e/providers/opencode-go/models/deepseek-v4.1-flash.toml",
+      "dialect": "openai-chat",
+      "facts": {
+        "reasoning.supported": true,
+        "tools.supported": true,
+        "structured_output.supported": true,
+        "sampling.temperature.supported": true,
+        "modalities.input.text": true,
+        "modalities.input.image": true,
+        "modalities.input.audio": false,
+        "modalities.input.video": false,
+        "modalities.input.pdf": false,
+        "modalities.input.embedding": false,
+        "modalities.output.text": true,
+        "modalities.output.image": false,
+        "modalities.output.audio": false,
+        "modalities.output.video": false,
+        "modalities.output.pdf": false,
+        "modalities.output.embedding": false,
+        "limits.context_window": 1000000,
+        "limits.max_output_tokens": 384000,
+        "reasoning.effort.supported": true,
+        "reasoning.effort.values": [
+          "low",
+          "high",
+          "max"
+        ]
+      }
+    },
+    "deepseek-v4-pro": {
+      "source": "https://github.com/anomalyco/models.dev/blob/205c4d569b6670625f845d018429847f5dea7e3e/providers/opencode-go/models/deepseek-v4-pro.toml",
+      "dialect": "openai-chat",
+      "facts": {
+        "reasoning.supported": true,
+        "tools.supported": true,
+        "structured_output.supported": true,
+        "sampling.temperature.supported": true,
+        "modalities.input.text": true,
+        "modalities.input.image": false,
+        "modalities.input.audio": false,
+        "modalities.input.video": false,
+        "modalities.input.pdf": false,
+        "modalities.input.embedding": false,
+        "modalities.output.text": true,
+        "modalities.output.image": false,
+        "modalities.output.audio": false,
+        "modalities.output.video": false,
+        "modalities.output.pdf": false,
+        "modalities.output.embedding": false,
+        "limits.context_window": 1000000,
+        "limits.max_output_tokens": 384000,
+        "reasoning.effort.supported": true,
+        "reasoning.effort.values": [
+          "high",
+          "max"
+        ]
+      }
+    },
+    "mimo-v2.6-flash": {
+      "source": "https://github.com/anomalyco/models.dev/blob/205c4d569b6670625f845d018429847f5dea7e3e/providers/opencode-go/models/mimo-v2.6-flash.toml",
+      "dialect": "openai-chat",
+      "facts": {
+        "reasoning.supported": true,
+        "tools.supported": true,
+        "sampling.temperature.supported": true,
+        "modalities.input.text": true,
+        "modalities.input.image": true,
+        "modalities.input.audio": true,
+        "modalities.input.video": true,
+        "modalities.input.pdf": false,
+        "modalities.input.embedding": false,
+        "modalities.output.text": true,
+        "modalities.output.image": false,
+        "modalities.output.audio": false,
+        "modalities.output.video": false,
+        "modalities.output.pdf": false,
+        "modalities.output.embedding": false,
+        "limits.context_window": 1048576,
+        "limits.max_output_tokens": 131072
+      }
+    },
+    "mimo-v2.6-pro": {
+      "source": "https://github.com/anomalyco/models.dev/blob/205c4d569b6670625f845d018429847f5dea7e3e/providers/opencode-go/models/mimo-v2.6-pro.toml",
+      "dialect": "openai-chat",
+      "facts": {
+        "reasoning.supported": true,
+        "tools.supported": true,
+        "sampling.temperature.supported": true,
+        "modalities.input.text": true,
+        "modalities.input.image": true,
+        "modalities.input.audio": true,
+        "modalities.input.video": true,
+        "modalities.input.pdf": false,
+        "modalities.input.embedding": false,
+        "modalities.output.text": true,
+        "modalities.output.image": false,
+        "modalities.output.audio": false,
+        "modalities.output.video": false,
+        "modalities.output.pdf": false,
+        "modalities.output.embedding": false,
+        "limits.context_window": 1048576,
+        "limits.max_output_tokens": 131072
+      }
+    },
+    "mimo-v2.5": {
+      "source": "https://github.com/anomalyco/models.dev/blob/205c4d569b6670625f845d018429847f5dea7e3e/providers/opencode-go/models/mimo-v2.5.toml",
+      "dialect": "openai-chat",
+      "facts": {
+        "reasoning.supported": true,
+        "tools.supported": true,
+        "sampling.temperature.supported": true,
+        "modalities.input.text": true,
+        "modalities.input.image": true,
+        "modalities.input.audio": true,
+        "modalities.input.video": true,
+        "modalities.input.pdf": false,
+        "modalities.input.embedding": false,
+        "modalities.output.text": true,
+        "modalities.output.image": false,
+        "modalities.output.audio": false,
+        "modalities.output.video": false,
+        "modalities.output.pdf": false,
+        "modalities.output.embedding": false,
+        "limits.context_window": 1000000,
+        "limits.max_output_tokens": 128000
+      }
+    },
+    "mimo-v2.5-pro": {
+      "source": "https://github.com/anomalyco/models.dev/blob/205c4d569b6670625f845d018429847f5dea7e3e/providers/opencode-go/models/mimo-v2.5-pro.toml",
+      "dialect": "openai-chat",
+      "facts": {
+        "reasoning.supported": true,
+        "tools.supported": true,
+        "sampling.temperature.supported": true,
+        "modalities.input.text": true,
+        "modalities.input.image": false,
+        "modalities.input.audio": false,
+        "modalities.input.video": false,
+        "modalities.input.pdf": false,
+        "modalities.input.embedding": false,
+        "modalities.output.text": true,
+        "modalities.output.image": false,
+        "modalities.output.audio": false,
+        "modalities.output.video": false,
+        "modalities.output.pdf": false,
+        "modalities.output.embedding": false,
+        "limits.context_window": 1048576,
+        "limits.max_output_tokens": 128000
+      }
+    },
+    "minimax-m3.1-flash": {
+      "source": "https://github.com/anomalyco/models.dev/blob/205c4d569b6670625f845d018429847f5dea7e3e/providers/opencode-go/models/minimax-m3.1-flash.toml",
+      "dialect": "openai-chat",
+      "facts": {
+        "reasoning.supported": true,
+        "tools.supported": true,
+        "sampling.temperature.supported": true,
+        "modalities.input.text": true,
+        "modalities.input.image": true,
+        "modalities.input.audio": false,
+        "modalities.input.video": true,
+        "modalities.input.pdf": false,
+        "modalities.input.embedding": false,
+        "modalities.output.text": true,
+        "modalities.output.image": false,
+        "modalities.output.audio": false,
+        "modalities.output.video": false,
+        "modalities.output.pdf": false,
+        "modalities.output.embedding": false,
+        "limits.context_window": 1000000,
+        "limits.max_output_tokens": 512000,
+        "reasoning.effort.supported": true,
+        "reasoning.effort.values": [
+          "low",
+          "medium",
+          "high",
+          "xhigh",
+          "max"
+        ]
+      }
+    },
+    "minimax-m3": {
+      "source": "https://github.com/anomalyco/models.dev/blob/205c4d569b6670625f845d018429847f5dea7e3e/providers/opencode-go/models/minimax-m3.toml",
+      "dialect": "anthropic",
+      "facts": {
+        "reasoning.supported": true,
+        "tools.supported": true,
+        "sampling.temperature.supported": true,
+        "modalities.input.text": true,
+        "modalities.input.image": true,
+        "modalities.input.audio": false,
+        "modalities.input.video": true,
+        "modalities.input.pdf": false,
+        "modalities.input.embedding": false,
+        "modalities.output.text": true,
+        "modalities.output.image": false,
+        "modalities.output.audio": false,
+        "modalities.output.video": false,
+        "modalities.output.pdf": false,
+        "modalities.output.embedding": false,
+        "limits.context_window": 1000000,
+        "limits.max_output_tokens": 131072,
+        "reasoning.toggle.supported": true,
+        "reasoning.toggle.native_parameter": {
+          "protocol": "anthropic",
+          "path": "thinking.type",
+          "values": {
+            "enabled": "adaptive",
+            "disabled": "disabled"
+          }
+        }
+      }
+    },
+    "muse-spark-1.3-contributor": {
+      "source": "https://github.com/anomalyco/models.dev/blob/205c4d569b6670625f845d018429847f5dea7e3e/providers/opencode-go/models/muse-spark-1.3-contributor.toml",
+      "dialect": "openai-responses",
+      "facts": {
+        "reasoning.supported": true,
+        "tools.supported": true,
+        "structured_output.supported": true,
+        "sampling.temperature.supported": true,
+        "modalities.input.text": true,
+        "modalities.input.image": true,
+        "modalities.input.audio": true,
+        "modalities.input.video": true,
+        "modalities.input.pdf": true,
+        "modalities.input.embedding": false,
+        "modalities.output.text": true,
+        "modalities.output.image": false,
+        "modalities.output.audio": false,
+        "modalities.output.video": false,
+        "modalities.output.pdf": false,
+        "modalities.output.embedding": false,
+        "limits.context_window": 1048576,
+        "limits.max_output_tokens": 131072,
+        "reasoning.effort.supported": true,
+        "reasoning.effort.values": [
+          "minimal",
+          "low",
+          "medium",
+          "high",
+          "xhigh"
+        ]
+      }
+    },
+    "muse-spark-1.2-contributor": {
+      "source": "https://github.com/anomalyco/models.dev/blob/205c4d569b6670625f845d018429847f5dea7e3e/providers/opencode-go/models/muse-spark-1.2-contributor.toml",
+      "dialect": "openai-responses",
+      "facts": {
+        "reasoning.supported": true,
+        "tools.supported": true,
+        "structured_output.supported": true,
+        "sampling.temperature.supported": true,
+        "modalities.input.text": true,
+        "modalities.input.image": true,
+        "modalities.input.audio": true,
+        "modalities.input.video": true,
+        "modalities.input.pdf": true,
+        "modalities.input.embedding": false,
+        "modalities.output.text": true,
+        "modalities.output.image": false,
+        "modalities.output.audio": false,
+        "modalities.output.video": false,
+        "modalities.output.pdf": false,
+        "modalities.output.embedding": false,
+        "limits.context_window": 1048576,
+        "limits.max_output_tokens": 131072,
+        "reasoning.effort.supported": true,
+        "reasoning.effort.values": [
+          "minimal",
+          "low",
+          "medium",
+          "high",
+          "xhigh"
+        ]
+      }
+    },
+    "qwen3.8-max": {
+      "source": "https://github.com/anomalyco/models.dev/blob/205c4d569b6670625f845d018429847f5dea7e3e/providers/opencode-go/models/qwen3.8-max.toml",
+      "dialect": "anthropic",
+      "facts": {
+        "reasoning.supported": true,
+        "tools.supported": true,
+        "structured_output.supported": true,
+        "sampling.temperature.supported": true,
+        "modalities.input.text": true,
+        "modalities.input.image": true,
+        "modalities.input.audio": false,
+        "modalities.input.video": true,
+        "modalities.input.pdf": false,
+        "modalities.input.embedding": false,
+        "modalities.output.text": true,
+        "modalities.output.image": false,
+        "modalities.output.audio": false,
+        "modalities.output.video": false,
+        "modalities.output.pdf": false,
+        "modalities.output.embedding": false,
+        "limits.context_window": 1000000,
+        "limits.max_output_tokens": 131072,
+        "reasoning.toggle.supported": true,
+        "reasoning.effort.supported": true,
+        "reasoning.effort.values": [
+          "low",
+          "medium",
+          "xhigh"
+        ],
+        "reasoning.budget.supported": true,
+        "reasoning.budget.max_tokens": 262144,
+        "reasoning.effort.native_parameter": {
+          "protocol": "anthropic",
+          "path": "output_config.effort"
+        },
+        "reasoning.toggle.native_parameter": {
+          "protocol": "anthropic",
+          "path": "thinking.type",
+          "values": {
+            "enabled": "enabled",
+            "disabled": "disabled"
+          }
+        },
+        "reasoning.budget.native_parameter": {
+          "protocol": "anthropic",
+          "path": "thinking.budget_tokens"
+        }
+      }
+    },
+    "qwen3.8-flash": {
+      "source": "https://github.com/anomalyco/models.dev/blob/205c4d569b6670625f845d018429847f5dea7e3e/providers/opencode-go/models/qwen3.8-flash.toml",
+      "dialect": "anthropic",
+      "facts": {
+        "reasoning.supported": true,
+        "tools.supported": true,
+        "structured_output.supported": true,
+        "sampling.temperature.supported": true,
+        "modalities.input.text": true,
+        "modalities.input.image": true,
+        "modalities.input.audio": false,
+        "modalities.input.video": true,
+        "modalities.input.pdf": false,
+        "modalities.input.embedding": false,
+        "modalities.output.text": true,
+        "modalities.output.image": false,
+        "modalities.output.audio": false,
+        "modalities.output.video": false,
+        "modalities.output.pdf": false,
+        "modalities.output.embedding": false,
+        "limits.context_window": 1000000,
+        "limits.max_output_tokens": 131072,
+        "reasoning.toggle.supported": true,
+        "reasoning.effort.supported": true,
+        "reasoning.effort.values": [
+          "low",
+          "medium",
+          "xhigh"
+        ],
+        "reasoning.budget.supported": true
+      }
+    },
+    "qwen3.7-plus": {
+      "source": "https://github.com/anomalyco/models.dev/blob/205c4d569b6670625f845d018429847f5dea7e3e/providers/opencode-go/models/qwen3.7-plus.toml",
+      "dialect": "anthropic",
+      "facts": {
+        "reasoning.supported": true,
+        "tools.supported": true,
+        "sampling.temperature.supported": true,
+        "modalities.input.text": true,
+        "modalities.input.image": true,
+        "modalities.input.audio": false,
+        "modalities.input.video": true,
+        "modalities.input.pdf": false,
+        "modalities.input.embedding": false,
+        "modalities.output.text": true,
+        "modalities.output.image": false,
+        "modalities.output.audio": false,
+        "modalities.output.video": false,
+        "modalities.output.pdf": false,
+        "modalities.output.embedding": false,
+        "limits.context_window": 1000000,
+        "limits.max_output_tokens": 65536,
+        "reasoning.toggle.supported": true,
+        "reasoning.budget.supported": true,
+        "reasoning.budget.max_tokens": 262144
+      }
+    },
+    "hy4-preview": {
+      "source": "https://github.com/anomalyco/models.dev/blob/205c4d569b6670625f845d018429847f5dea7e3e/providers/opencode-go/models/hy4-preview.toml",
+      "dialect": "openai-chat",
+      "facts": {
+        "reasoning.supported": true,
+        "tools.supported": true,
+        "sampling.temperature.supported": true,
+        "modalities.input.text": true,
+        "modalities.input.image": false,
+        "modalities.input.audio": false,
+        "modalities.input.video": false,
+        "modalities.input.pdf": false,
+        "modalities.input.embedding": false,
+        "modalities.output.text": true,
+        "modalities.output.image": false,
+        "modalities.output.audio": false,
+        "modalities.output.video": false,
+        "modalities.output.pdf": false,
+        "modalities.output.embedding": false,
+        "limits.context_window": 1024000,
+        "limits.max_output_tokens": 64000,
+        "reasoning.effort.supported": true,
+        "reasoning.effort.values": [
+          "none",
+          "high"
+        ]
+      }
+    },
+    "hy3": {
+      "source": "https://github.com/anomalyco/models.dev/blob/205c4d569b6670625f845d018429847f5dea7e3e/providers/opencode-go/models/hy3.toml",
+      "dialect": "openai-chat",
+      "facts": {
+        "reasoning.supported": true,
+        "tools.supported": true,
+        "sampling.temperature.supported": true,
+        "modalities.input.text": true,
+        "modalities.input.image": false,
+        "modalities.input.audio": false,
+        "modalities.input.video": false,
+        "modalities.input.pdf": false,
+        "modalities.input.embedding": false,
+        "modalities.output.text": true,
+        "modalities.output.image": false,
+        "modalities.output.audio": false,
+        "modalities.output.video": false,
+        "modalities.output.pdf": false,
+        "modalities.output.embedding": false,
+        "limits.context_window": 256000,
+        "limits.max_input_tokens": 192000,
+        "limits.max_output_tokens": 128000,
+        "reasoning.effort.supported": true,
+        "reasoning.effort.values": [
+          "none",
+          "low",
+          "high"
+        ]
+      }
+    },
+    "step-5-preview": {
+      "source": "https://github.com/anomalyco/models.dev/blob/205c4d569b6670625f845d018429847f5dea7e3e/providers/opencode-go/models/step-5-preview.toml",
+      "dialect": "openai-chat",
+      "facts": {
+        "reasoning.supported": true,
+        "tools.supported": true,
+        "structured_output.supported": true,
+        "sampling.temperature.supported": true,
+        "modalities.input.text": true,
+        "modalities.input.image": true,
+        "modalities.input.audio": false,
+        "modalities.input.video": true,
+        "modalities.input.pdf": false,
+        "modalities.input.embedding": false,
+        "modalities.output.text": true,
+        "modalities.output.image": false,
+        "modalities.output.audio": false,
+        "modalities.output.video": false,
+        "modalities.output.pdf": false,
+        "modalities.output.embedding": false,
+        "limits.context_window": 1000000,
+        "limits.max_input_tokens": 1000000,
+        "limits.max_output_tokens": 65536,
+        "reasoning.effort.supported": true,
+        "reasoning.effort.values": [
+          "low",
+          "medium",
+          "high"
+        ]
+      }
+    },
+    "beam-free": {
+      "source": "https://github.com/anomalyco/models.dev/blob/205c4d569b6670625f845d018429847f5dea7e3e/providers/opencode-go/models/beam-free.toml",
+      "dialect": "openai-chat",
+      "facts": {
+        "reasoning.supported": true,
+        "tools.supported": true,
+        "structured_output.supported": true,
+        "sampling.temperature.supported": true,
+        "modalities.input.text": true,
+        "modalities.input.image": false,
+        "modalities.input.audio": false,
+        "modalities.input.video": false,
+        "modalities.input.pdf": false,
+        "modalities.input.embedding": false,
+        "modalities.output.text": true,
+        "modalities.output.image": false,
+        "modalities.output.audio": false,
+        "modalities.output.video": false,
+        "modalities.output.pdf": false,
+        "modalities.output.embedding": false,
+        "limits.context_window": 1048576,
+        "limits.max_output_tokens": 131072,
+        "reasoning.effort.supported": true,
+        "reasoning.effort.values": [
+          "low",
+          "medium",
+          "high",
+          "xhigh",
+          "max"
+        ]
+      }
+    }
+  }
+}

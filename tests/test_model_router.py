@@ -983,8 +983,11 @@ def test_translated_tools_and_reasoning_remain_generation_data(
             "tools": [{"name": "lookup", "input_schema": schema}],
         })
     raw = _config(upstream)
+    if ingress == "anthropic":
+        # A native token budget becomes an effort bucket on these bridges.
+        raw["providers"]["chat" if model == "m-chat" else "resp"]["compatibility"] = "lossy"
     # Use a model with known reasoning support in LiteLLM's local metadata;
-    # synthetic "upstream-anthropic" otherwise drops reasoning by policy.
+    # synthetic "upstream-anthropic" has no adapter reasoning mapping.
     raw["models"][0]["model"] = "claude-3-7-sonnet-20250219"
     if model == "m-anth":
         body["max_tokens" if ingress == "openai-chat" else "max_output_tokens"] = 40000
@@ -2072,7 +2075,11 @@ def test_llama_cpp_discovers_models_aliases_and_context(
         )
         assert entry["display_name"] == "tiny"
         assert entry["context_window"] == 4096
-        assert entry["max_tokens"] == 4096
+        assert entry["max_tokens"] is None
+        assert entry["metadata"]["limits"]["context_window"] == {
+            "value": 4096, "source": "/v1/models.meta.n_ctx", "kind": "reported",
+        }
+        assert entry["metadata"]["max_output_tokens"] is None
         assert entry["metadata"]["llama_cpp"] == {
             "server": llama_server.url,
             "mode": "single",
@@ -2345,3 +2352,376 @@ def test_llama_cpp_config_validation(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("LLAMA_TEST_KEY", raising=False)
     with pytest.raises(SystemExit):
         mr.build_config({"llama_cpp": {"api_key_env": "LLAMA_TEST_KEY"}})
+
+
+@pytest.mark.parametrize("second_url", ["http://127.0.0.1:9002", "http://127.0.0.1:9001"])
+def test_llama_cpp_rejects_audit_duplicate_names_before_probing(
+    monkeypatch: pytest.MonkeyPatch, second_url: str,
+) -> None:
+    def unexpected_probe(*args: Any, **kwargs: Any) -> None:
+        pytest.fail("Ambiguous identities must fail before network discovery")
+
+    monkeypatch.setattr(mr.App, "_probe_llama_server", unexpected_probe)
+    with pytest.raises(SystemExit, match="duplicate explicit provider name 'local'") as exc:
+        mr.App(mr.build_config({"llama_cpp": {"servers": [
+            {"url": "http://127.0.0.1:9001", "name": "local"},
+            {"url": second_url, "name": "local"},
+        ]}}))
+    assert "servers[1]" in str(exc.value)
+    assert "servers[0]" in str(exc.value)
+    assert "unique name or omit names" in str(exc.value)
+
+
+@pytest.mark.parametrize("reserved", [False, True])
+def test_llama_cpp_generated_collisions_keep_identity_through_health_changes(
+    monkeypatch: pytest.MonkeyPatch, reserved: bool,
+) -> None:
+    # Different URLs normalize to the same generated base name.
+    urls = ["http://127.0.0.1:9001/a/b", "http://127.0.0.1:9001/a-b"]
+    base = "llama-127.0.0.1-9001-a-b"
+    servers: list[Any] = [{"url": url, "api_key": f"dummy-{i}"}
+                          for i, url in enumerate(urls)]
+    raw: dict[str, Any] = {"llama_cpp": {"servers": servers, "refresh_seconds": 0}}
+    expected = [base, base + "-2"]
+    if reserved:
+        raw["providers"] = {base: {"dialect": "openai-chat", "base_url": urls[0],
+                                   "api_key": "dummy-static"}}
+        # Even a later, unreachable explicit server reserves its name before
+        # either generated identity is allocated.
+        servers.append({"url": "http://127.0.0.1:9003", "name": base + "-2"})
+        expected = [base + "-3", base + "-4"]
+
+    reachable = {urls[1]}
+
+    def probe(app: mr.App, llama: mr.LlamaCppConfig, server: mr.LlamaCppServer) -> dict[str, Any]:
+        # Identities must already exist when the very first probe begins.
+        assert [app._llama_names[url] for url in urls] == expected
+        if server.url not in reachable:
+            return {"server": server, "error": "controlled outage"}
+        i = urls.index(server.url)
+        return {"server": server, "rows": [{"id": f"model-{i}", "aliases": [f"alias-{i}"]}],
+                "props": {}}
+
+    def send(client: httpx.Client, request: httpx.Request, **kwargs: Any) -> httpx.Response:
+        assert request.method == "POST"
+        request.read()
+        model = json.loads(request.content)["model"]
+        i = int(model.removeprefix("model-"))
+        assert str(request.url) == urls[i] + "/v1/chat/completions"
+        assert request.headers["authorization"] == f"Bearer dummy-{i}"
+        return httpx.Response(200, json={"selected": i}, request=request)
+
+    monkeypatch.setattr(mr.App, "_probe_llama_server", probe)
+    monkeypatch.setattr(httpx.Client, "send", send)
+    app = mr.App(mr.build_config(raw))
+    try:
+        assert app._llama_names[urls[0]] == expected[0]
+        assert app._llama_names[urls[1]] == expected[1]
+        seen: set[str] = set()
+        for live in ({urls[1]}, {urls[0]}, set(urls), {urls[1]}, set(), set(urls)):
+            reachable.clear()
+            reachable.update(live)
+            seen.update(live)
+            app.refresh_llama_cpp(force=True)
+            status = app.llama_cpp_status()
+            for i, url in enumerate(urls):
+                state = status["servers"][i]
+                assert state["provider"] == expected[i]
+                assert state["reachable"] == (url in live)
+                assert state["stale"] == (url in seen and url not in live)
+                route = app.resolve(f"model-{i}")
+                if url not in seen:
+                    assert route is None
+                    continue
+                assert route is not None
+                assert route.provider_name == expected[i]
+                assert app.resolve(f"alias-{i}") is route
+                plan = app.dispatch("openai-chat", route, _body("openai-chat", route.name, False), {})
+                assert json.loads(plan.body) == {"selected": i}
+            entries = app.models_payload()["data"]
+            assert {entry["id"] for entry in entries} == {
+                f"model-{i}" for i, url in enumerate(urls) if url in seen
+            }
+            for entry in entries:
+                i = int(entry["id"].removeprefix("model-"))
+                assert entry["owned_by"] == expected[i]
+                assert entry["metadata"]["llama_cpp"]["server"] == urls[i]
+    finally:
+        app.close()
+
+
+def test_llama_cpp_explicit_name_cannot_shadow_static_provider() -> None:
+    with pytest.raises(SystemExit, match="already configured in providers.*unique server name"):
+        mr.build_config({
+            "providers": {"local": {"dialect": "openai-chat", "base_url": "http://127.0.0.1:9000"}},
+            "llama_cpp": {"servers": [{"url": "http://127.0.0.1:9001", "name": "local"}]},
+        })
+
+
+@pytest.mark.parametrize("ingress", INGRESSES)
+@pytest.mark.parametrize("selection", ["llama-test", "tiny", "local/manual-model"])
+@pytest.mark.parametrize("change", ["remove", "replace"])
+def test_refresh_between_resolution_and_dispatch_pins_provider(
+    monkeypatch: pytest.MonkeyPatch, ingress: str, selection: str, change: str,
+) -> None:
+    server = FakeLlamaServer().start()
+    app = mr.App(mr.build_config(_llama_only_config(server, servers=[{
+        "url": server.url, "name": "local", "api_key": "dummy-old-key",
+    }])))
+    resolved = threading.Event()
+    resume = threading.Event()
+    original_resolve = app.resolve
+
+    def paused_resolve(model: str) -> mr.Route | None:
+        route = original_resolve(model)
+        resolved.set()
+        assert resume.wait(10), "test did not release resolution"
+        return route
+
+    monkeypatch.setattr(app, "resolve", paused_resolve)
+    router_server = mr.serve(app, "127.0.0.1", 0)
+    thread = threading.Thread(target=router_server.serve_forever,
+                              kwargs={"poll_interval": 0.01}, daemon=True)
+    thread.start()
+    base_url = f"http://127.0.0.1:{router_server.server_address[1]}"
+    try:
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            pending = pool.submit(httpx.post, base_url + PATHS[ingress],
+                                  json=_body(ingress, selection, False), timeout=15)
+            try:
+                assert resolved.wait(10), "request never reached resolution"
+                assert app.config.llama_cpp is not None
+                if change == "remove":
+                    app.config.llama_cpp.servers.clear()
+                else:
+                    old = app.config.llama_cpp.servers[0]
+                    app.config.llama_cpp.servers[0] = mr.replace(old, api_key="dummy-new-key")
+                    server.models = [{"id": "new-model"}]
+                app.refresh_llama_cpp(force=True)
+                assert original_resolve("llama-test") is None
+                assert original_resolve("tiny") is None
+                if change == "remove":
+                    assert original_resolve("local/manual-model") is None
+                    assert app.provider_count() == 0
+                else:
+                    assert app.provider("local").api_key == "dummy-new-key"
+                    assert original_resolve("new-model") is not None
+            finally:
+                resume.set()
+            response = pending.result(timeout=15)
+        assert response.status_code == 200, response.text
+        assert _text_from_response(ingress, response.json()) == "llama pong"
+        sent = server.last_request("/v1/chat/completions")
+        assert sent["headers"]["authorization"] == "Bearer dummy-old-key"
+        assert sent["body"]["model"] == (
+            "manual-model" if selection == "local/manual-model" else "llama-test"
+        )
+        if change == "replace":
+            response = httpx.post(base_url + PATHS[ingress], json=_body(ingress, "new-model", False))
+            assert response.status_code == 200, response.text
+            assert server.last_request("/v1/chat/completions")["headers"]["authorization"] == "Bearer dummy-new-key"
+    finally:
+        resume.set()
+        router_server.shutdown()
+        router_server.server_close()
+        app.close()
+        server.stop()
+
+
+def test_model_listing_retains_snapshot_during_refresh(
+    monkeypatch: pytest.MonkeyPatch, llama_server: FakeLlamaServer,
+) -> None:
+    app = mr.App(mr.build_config(_llama_only_config(llama_server)))
+    entered = threading.Event()
+    resume = threading.Event()
+    original_entry = app._route_entry
+
+    def paused_entry(route: mr.Route, now: int, snapshot: mr.RegistrySnapshot) -> dict[str, Any]:
+        entered.set()
+        assert resume.wait(10)
+        return original_entry(route, now, snapshot)
+
+    monkeypatch.setattr(app, "_route_entry", paused_entry)
+    try:
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            pending = pool.submit(app.models_payload)
+            try:
+                assert entered.wait(10)
+                app.config.llama_cpp.servers.clear()
+                app.refresh_llama_cpp(force=True)
+                assert app.models_payload()["data"] == []
+            finally:
+                resume.set()
+            old_listing = pending.result(timeout=10)
+        assert [entry["id"] for entry in old_listing["data"]] == ["llama-test"]
+        assert old_listing["data"][0]["metadata"]["provider_dialect"] == "openai-chat"
+        assert old_listing["data"][0]["metadata"]["router"]["freshness"]["discovery"]["stale"] is False
+    finally:
+        resume.set()
+        app.close()
+
+
+def test_health_retains_inventory_and_status_generation(
+    monkeypatch: pytest.MonkeyPatch, llama_server: FakeLlamaServer,
+) -> None:
+    app = mr.App(mr.build_config(_llama_only_config(llama_server)))
+    entered = threading.Event()
+    resume = threading.Event()
+    original_status = app.catalog_status
+
+    def paused_status(snapshot: mr.RegistrySnapshot | None = None) -> dict[str, Any]:
+        entered.set()
+        assert resume.wait(10)
+        return original_status(snapshot)
+
+    monkeypatch.setattr(app, "catalog_status", paused_status)
+    try:
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            pending = pool.submit(app.health_payload)
+            try:
+                assert entered.wait(10)
+                app.config.llama_cpp.servers.clear()
+                app.refresh_llama_cpp(force=True)
+            finally:
+                resume.set()
+            old_health = pending.result(timeout=10)
+        assert old_health["models"] == old_health["llama_cpp"]["models"] == 1
+        assert old_health["providers"] == 1
+        assert len(old_health["llama_cpp"]["servers"]) == 1
+        new_health = app.health_payload()
+        assert new_health["models"] == new_health["llama_cpp"]["models"] == 0
+        assert new_health["providers"] == 0
+        assert new_health["llama_cpp"]["servers"] == []
+    finally:
+        resume.set()
+        app.close()
+
+
+@contextmanager
+def controlled_registry(monkeypatch: pytest.MonkeyPatch) -> Iterator[tuple[mr.App, dict[str, Any]]]:
+    state: dict[str, Any] = {
+        "local": [{"id": "shared"}, {"id": "local-wins", "aliases": ["local-alias"]},
+                  {"id": "explicit-alias"}, {"id": "disabled"}],
+        "catalog": ["shared", "local-wins", "catalog-only", "explicit-alias", "disabled"],
+        "local_error": None, "catalog_error": False,
+    }
+
+    def probe(app: mr.App, llama: mr.LlamaCppConfig, server: mr.LlamaCppServer) -> dict[str, Any]:
+        return {"server": server, "rows": state["local"], "props": {},
+                "error": state["local_error"]}
+
+    def send(client: httpx.Client, request: httpx.Request, **kwargs: Any) -> httpx.Response:
+        assert request.method == "GET" and str(request.url) == "http://127.0.0.1:9000/catalog"
+        return httpx.Response(503 if state["catalog_error"] else 200,
+                              json={"data": state["catalog"]}, request=request)
+
+    monkeypatch.setattr(mr.App, "_probe_llama_server", probe)
+    monkeypatch.setattr(httpx.Client, "send", send)
+    app = mr.App(mr.build_config({
+        "providers": {"static": {"dialect": "openai-responses", "base_url": "http://127.0.0.1:9000/v1"}},
+        "models": [{"name": "shared", "provider": "static", "aliases": ["explicit-alias"]},
+                   {"name": "disabled", "provider": "static", "enabled": False}],
+        "catalog": {"url": "http://127.0.0.1:9000/catalog", "refresh_seconds": 0,
+                    "rules": [{"match": ".", "provider": "static"}]},
+        "llama_cpp": {"servers": [{"url": "http://127.0.0.1:9001", "name": "local"}],
+                      "refresh_seconds": 0},
+    }))
+    try:
+        yield app, state
+    finally:
+        app.close()
+
+
+def test_registry_preserves_route_precedence_and_stale_routes(monkeypatch: pytest.MonkeyPatch) -> None:
+    with controlled_registry(monkeypatch) as (app, state):
+        assert app.resolve("shared").provider_name == "static"
+        assert app.resolve("explicit-alias") is app.resolve("shared")
+        assert app.resolve("local-wins").provider_name == "local"
+        assert app.resolve("local-alias") is app.resolve("local-wins")
+        assert app.resolve("catalog-only").provider_name == "static"
+        assert app.resolve("disabled") is None
+        public = {entry["id"]: entry for entry in app.models_payload()["data"]}
+        assert set(public) == {"shared", "local-wins", "catalog-only"}
+        assert public["shared"]["owned_by"] == "static"
+        assert public["local-wins"]["owned_by"] == "local"
+
+        state["local_error"] = "controlled local failure"
+        state["catalog_error"] = True
+        app.refresh_llama_cpp(force=True)
+        app.refresh_catalog(force=True)
+        assert app.resolve("local-wins").provider_name == "local"
+        assert app.resolve("local-alias") is app.resolve("local-wins")
+        assert app.resolve("catalog-only").provider_name == "static"
+        assert app.llama_cpp_status()["servers"][0]["stale"] is True
+        assert app.catalog_status()["error"] is not None
+
+        # A successful empty model list replaces the old source inventory;
+        # lower-priority catalog routes become available again.
+        state["local_error"] = None
+        state["local"] = []
+        app.refresh_llama_cpp(force=True)
+        assert app.resolve("local-wins").provider_name == "static"
+        assert app.resolve("local-alias") is None
+        assert app.llama_cpp_status()["servers"][0]["stale"] is False
+        assert app.llama_cpp_status()["models"] == 0
+
+
+def test_concurrent_catalog_and_local_publications_keep_both_updates(monkeypatch: pytest.MonkeyPatch) -> None:
+    with controlled_registry(monkeypatch) as (app, state):
+        before = app._registry
+        state["local"] = [{"id": "new-local"}]
+        state["catalog"] = ["new-catalog"]
+        ready = threading.Barrier(3, timeout=10)
+        publish = threading.Event()
+        original_publish = app._publish_registry
+
+        def paused_publish(**kwargs: Any) -> None:
+            ready.wait()
+            assert publish.wait(10)
+            original_publish(**kwargs)
+
+        monkeypatch.setattr(app, "_publish_registry", paused_publish)
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            local = pool.submit(app.refresh_llama_cpp, force=True)
+            catalog = pool.submit(app.refresh_catalog, force=True)
+            try:
+                ready.wait()
+                # Neither half-built inventory nor status has been published.
+                assert app._registry is before
+                health = app.health_payload()
+                assert health["llama_cpp"]["models"] == 1
+                assert health["catalog"]["models"] == 5
+            finally:
+                publish.set()
+            local.result(timeout=10)
+            catalog.result(timeout=10)
+        assert app.resolve("new-local").provider_name == "local"
+        assert app.resolve("new-catalog").provider_name == "static"
+        assert app.resolve("local-wins") is None
+        assert app.resolve("catalog-only") is None
+        health = app.health_payload()
+        assert health["models"] == 3  # explicit shared plus the two new models
+        assert health["llama_cpp"]["models"] == health["catalog"]["models"] == 1
+
+
+def test_registry_metadata_and_transport_settings_are_immutable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with controlled_registry(monkeypatch) as (app, state):
+        snapshot = app._registry
+        route = app.resolve("local-wins")
+        with pytest.raises(TypeError):
+            snapshot.providers["other"] = app.provider("local")
+        with pytest.raises(TypeError):
+            route.metadata["llama_cpp"]["server"] = "http://127.0.0.1:9999"
+        with pytest.raises(TypeError):
+            route._provider.headers["Authorization"] = "Bearer changed"
+        entries = app.models_payload()["data"]
+        local = next(entry for entry in entries if entry["id"] == "local-wins")
+        local["metadata"]["llama_cpp"]["server"] = "changed"
+        local["metadata"]["capabilities"].append("changed")
+        state["local"][1]["aliases"].append("changed")
+        fresh = next(entry for entry in app.models_payload()["data"] if entry["id"] == "local-wins")
+        assert fresh["metadata"]["llama_cpp"]["server"] == "http://127.0.0.1:9001"
+        assert fresh["metadata"]["capabilities"] == ["text"]
+        assert app.resolve("changed") is None

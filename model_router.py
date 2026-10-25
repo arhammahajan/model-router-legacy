@@ -37,6 +37,7 @@ import json
 import logging
 import math
 import os
+import random
 import re
 import socket
 import sys
@@ -45,10 +46,11 @@ import time
 import uuid
 import zlib
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from itertools import chain
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any, AsyncIterator, Callable, Iterator, Mapping
 from urllib.parse import parse_qsl, quote, quote_plus, unquote, urlsplit
 
@@ -58,10 +60,11 @@ os.environ.setdefault("LITELLM_LOCAL_MODEL_COST_MAP", "True")
 
 import httpx
 import litellm
+import router_metadata
 
 litellm.telemetry = False
 litellm.suppress_debug_info = True
-litellm.drop_params = True
+litellm.drop_params = False
 
 try:
     # LiteLLM's Anthropic Messages adapters.  These are the same code paths the
@@ -72,6 +75,7 @@ try:
     from litellm.llms.anthropic.pass_through.responses_adapters.handler import (
         LiteLLMMessagesToResponsesAPIHandler,
     )
+    from litellm.llms.custom_httpx.http_handler import HTTPHandler
 except ImportError as exc:  # pragma: no cover - startup guard
     raise SystemExit(
         "This router needs litellm>=1.106.4,<2. The installed version is missing "
@@ -134,6 +138,12 @@ DEFAULT_LLAMA_URL = "http://127.0.0.1:9931"
 DEFAULT_LLAMA_CONTEXT = 128000
 DEFAULT_LLAMA_REFRESH = 30.0
 DEFAULT_LLAMA_PROBE_TIMEOUT = 2.0
+LLAMA_LIMIT_FIELDS = (
+    "context_window", "trained_context_window", "max_input_tokens",
+    "max_output_tokens", "default_output_tokens",
+)
+REFRESH_BACKOFF_BASE = 5.0
+REFRESH_BACKOFF_MAX = 300.0
 
 _HOP_BY_HOP = {
     "connection",
@@ -483,19 +493,41 @@ def _as_str(raw: Mapping[str, Any], key: str, *, where: str) -> str:
     return value.strip()
 
 
+def _freeze(value: Any) -> Any:
+    """Copy JSON-like registry data into immutable containers."""
+    if isinstance(value, Mapping):
+        return MappingProxyType({key: _freeze(item) for key, item in value.items()})
+    if isinstance(value, (list, tuple)):
+        return tuple(_freeze(item) for item in value)
+    return value
+
+
+def _thaw(value: Any) -> Any:
+    """Return independently mutable JSON data for adapters and public payloads."""
+    if isinstance(value, Mapping):
+        return {key: _thaw(item) for key, item in value.items()}
+    if isinstance(value, tuple):
+        return [_thaw(item) for item in value]
+    return value
+
+
 @dataclass(frozen=True)
 class Provider:
     name: str
     dialect: str
     base_url: str
     api_key: str
-    headers: dict[str, str]
+    headers: Mapping[str, str]
     timeout: float
     litellm_provider: str
-    litellm_kwargs: dict[str, Any]
+    litellm_kwargs: Mapping[str, Any]
     drop_params: bool
     session_header: str = ""
     auth_header: str = ""
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "headers", _freeze(self.headers))
+        object.__setattr__(self, "litellm_kwargs", _freeze(self.litellm_kwargs))
 
     @property
     def effective_api_key(self) -> str:
@@ -517,7 +549,7 @@ class Provider:
     def litellm_call_kwargs(
         self, *, skip_mcp: bool = False, session_id: str | None = None
     ) -> dict[str, Any]:
-        kwargs: dict[str, Any] = dict(self.litellm_kwargs)
+        kwargs: dict[str, Any] = _thaw(self.litellm_kwargs)
         api_base = self.base_url
         if self.litellm_provider == "anthropic":
             # LiteLLM appends /v1/messages itself, so an origin-style base is
@@ -548,7 +580,9 @@ class Provider:
         kwargs["headers"] = dict(extra_headers)
         kwargs["extra_headers"] = extra_headers
         kwargs.setdefault("timeout", self.timeout)
-        kwargs.setdefault("drop_params", self.drop_params)
+        # Loss is handled before calling adapters, including in explicit lossy
+        # mode. Never let LiteLLM silently remove additional parameters.
+        kwargs["drop_params"] = False
         if skip_mcp:
             kwargs.setdefault("_skip_mcp_handler", True)
         return kwargs
@@ -560,8 +594,55 @@ class Route:
     provider_name: str
     upstream_model: str
     dialect: str
-    metadata: dict[str, Any] = field(default_factory=dict)
+    metadata: Mapping[str, Any] = field(default_factory=dict)
     enabled: bool = True
+    # Resolution pins the transport identity even after a newer registry is
+    # published. Exclude credentials from repr/equality.
+    _provider: Provider | None = field(default=None, repr=False, compare=False)
+    _capabilities: Mapping[str, Any] = field(default_factory=dict, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "metadata", _freeze(self.metadata))
+        object.__setattr__(self, "_capabilities", _freeze(self._capabilities))
+
+
+@dataclass(frozen=True)
+class RefreshState:
+    # Monotonic process-local times; None also works with clocks starting at 0.
+    last_success: float | None = None
+    last_attempt: float | None = None
+    next_attempt: float | None = None
+    consecutive_failures: int = 0
+
+
+@dataclass(frozen=True)
+class CatalogSnapshot:
+    routes: Mapping[str, Route] = field(default_factory=lambda: _freeze({}))
+    refresh: RefreshState = field(default_factory=RefreshState)
+    error: str | None = None
+    unmapped: frozenset[str] = frozenset()
+
+
+@dataclass(frozen=True)
+class LlamaSnapshot:
+    providers: Mapping[str, Provider] = field(default_factory=lambda: _freeze({}))
+    routes: Mapping[str, Route] = field(default_factory=lambda: _freeze({}))
+    public: tuple[Route, ...] = ()
+    by_server: Mapping[str, tuple[Provider, Mapping[str, Route], tuple[Route, ...]]] = field(
+        default_factory=lambda: _freeze({})
+    )
+    servers: tuple[Mapping[str, Any], ...] = ()
+    refresh: RefreshState = field(default_factory=RefreshState)
+    error: str | None = None
+
+
+@dataclass(frozen=True)
+class RegistrySnapshot:
+    providers: Mapping[str, Provider]
+    routes: Mapping[str, Route]
+    public: tuple[Route, ...]
+    catalog: CatalogSnapshot
+    llama: LlamaSnapshot
 
 
 @dataclass(frozen=True)
@@ -577,6 +658,10 @@ class CatalogConfig:
     timeout: float
     refresh_seconds: float
     rules: list[CatalogRule]
+    # Exact IDs take precedence over optional regex rules. Values reference
+    # trusted providers; catalog responses cannot supply endpoints or keys.
+    model_providers: dict[str, str] = field(default_factory=dict)
+    metadata_source: str | None = None
 
 
 @dataclass(frozen=True)
@@ -598,6 +683,10 @@ class LlamaCppConfig:
     context_fallback: int
     prefix: str
     expose_aliases: bool
+    limit_overrides: Mapping[str, Mapping[str, int | None]] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "limit_overrides", _freeze(self.limit_overrides))
 
 
 @dataclass
@@ -616,9 +705,12 @@ class Config:
     header_read_timeout: float = DEFAULT_HEADER_READ_TIMEOUT
     body_read_timeout: float = DEFAULT_BODY_READ_TIMEOUT
     write_timeout: float = DEFAULT_WRITE_TIMEOUT
+    capability_overrides: Mapping[str, Mapping[str, Any]] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         # Also validate Config instances constructed directly by embedders.
+        self.capability_overrides = _freeze(self.capability_overrides)
+        _llama_provider_names(self)
         for name in ("max_connections", "max_generations"):
             value = getattr(self, name)
             if type(value) is not int or value <= 0:
@@ -761,6 +853,12 @@ def _build_provider(name: str, raw: Mapping[str, Any]) -> Provider:
     litellm_kwargs_raw = raw.get("litellm_kwargs") or {}
     if not isinstance(litellm_kwargs_raw, Mapping):
         raise SystemExit(f"{where}: 'litellm_kwargs' must be a table/object")
+    compatibility = raw.get("compatibility", "lossy" if raw.get("drop_params") is True else "strict")
+    if compatibility not in ("strict", "lossy"):
+        raise SystemExit(f"{where}: 'compatibility' must be 'strict' or 'lossy'")
+    if "drop_params" in raw and (type(raw["drop_params"]) is not bool
+                                 or raw["drop_params"] != (compatibility == "lossy")):
+        raise SystemExit(f"{where}: 'drop_params' must be boolean and agree with 'compatibility'")
 
     session_header = raw.get("session_header") or ""
     if not isinstance(session_header, str):
@@ -787,7 +885,7 @@ def _build_provider(name: str, raw: Mapping[str, Any]) -> Provider:
         timeout=timeout,
         litellm_provider=litellm_provider,
         litellm_kwargs=dict(litellm_kwargs_raw),
-        drop_params=bool(raw.get("drop_params", True)),
+        drop_params=compatibility == "lossy",
         session_header=session_header,
         auth_header=auth_header,
     )
@@ -822,20 +920,36 @@ def _build_llama_cpp(raw: Mapping[str, Any]) -> LlamaCppConfig:
         refresh_seconds = float(
             raw.get("refresh_seconds", DEFAULT_LLAMA_REFRESH)
         )
-        context_fallback = int(
-            raw.get("context_fallback", DEFAULT_LLAMA_CONTEXT)
-        )
     except (TypeError, ValueError) as exc:
         raise SystemExit(
-            f"{where}: 'timeout', 'refresh_seconds' and 'context_fallback' "
+            f"{where}: 'timeout' and 'refresh_seconds' "
             "must be numbers"
         ) from exc
-    if probe_timeout <= 0:
-        raise SystemExit(f"{where}: 'timeout' must be positive")
-    if refresh_seconds < 0:
-        raise SystemExit(f"{where}: 'refresh_seconds' must be >= 0")
-    if context_fallback <= 0:
-        raise SystemExit(f"{where}: 'context_fallback' must be positive")
+    if not math.isfinite(probe_timeout) or not 0 < probe_timeout <= threading.TIMEOUT_MAX:
+        raise SystemExit(f"{where}: 'timeout' must be finite, positive and <= threading.TIMEOUT_MAX")
+    if not math.isfinite(refresh_seconds) or not 0 <= refresh_seconds <= threading.TIMEOUT_MAX:
+        raise SystemExit(f"{where}: 'refresh_seconds' must be finite, >= 0 and <= threading.TIMEOUT_MAX")
+    context_fallback = raw.get("context_fallback", DEFAULT_LLAMA_CONTEXT)
+    if type(context_fallback) is not int or context_fallback <= 0:
+        raise SystemExit(f"{where}: 'context_fallback' must be a positive integer")
+
+    overrides_raw = raw.get("limit_overrides", {})
+    if not isinstance(overrides_raw, Mapping):
+        raise SystemExit(f"{where}.limit_overrides: must be a table/object")
+    limit_overrides: dict[str, dict[str, int | None]] = {}
+    for model_id, limits in overrides_raw.items():
+        label = f"{where}.limit_overrides[{model_id!r}]"
+        if not isinstance(model_id, str) or not model_id.strip() or model_id != model_id.strip():
+            raise SystemExit(f"{label}: model ID must be a nonempty string without surrounding whitespace")
+        if not isinstance(limits, Mapping):
+            raise SystemExit(f"{label}: must be a table/object")
+        for key, value in limits.items():
+            if key not in LLAMA_LIMIT_FIELDS:
+                raise SystemExit(f"{label}: unknown limit {key!r}")
+            minimum = 0 if key == "default_output_tokens" else 1
+            if value is not None and (type(value) is not int or value < minimum):
+                raise SystemExit(f"{label}.{key}: must be an integer >= {minimum} or null")
+        limit_overrides[model_id] = dict(limits)
 
     prefix = raw.get("prefix") or ""
     if not isinstance(prefix, str):
@@ -876,6 +990,7 @@ def _build_llama_cpp(raw: Mapping[str, Any]) -> LlamaCppConfig:
 
     servers: list[LlamaCppServer] = []
     seen: set[str] = set()
+    explicit_names: dict[str, int] = {}
     for index, entry in enumerate(entries):
         entry_where = f"{where}.servers[{index}]"
         if isinstance(entry, str):
@@ -912,6 +1027,14 @@ def _build_llama_cpp(raw: Mapping[str, Any]) -> LlamaCppConfig:
             raise SystemExit(
                 f"{entry_where}: must be a URL string or a table with 'url'"
             )
+        if name:
+            if name in explicit_names:
+                raise SystemExit(
+                    f"{entry_where}.name: duplicate explicit provider name {name!r}; "
+                    f"already used by llama_cpp.servers[{explicit_names[name]}]. "
+                    "Assign each server a unique name or omit names to generate them."
+                )
+            explicit_names[name] = index
         if url in seen:
             continue
         seen.add(url)
@@ -929,11 +1052,17 @@ def _build_llama_cpp(raw: Mapping[str, Any]) -> LlamaCppConfig:
         context_fallback=context_fallback,
         prefix=prefix,
         expose_aliases=bool(raw.get("aliases", True)),
+        limit_overrides=limit_overrides,
     )
 
 
 def build_config(raw: Mapping[str, Any]) -> Config:
     """Validate a config mapping and return a Config."""
+
+    capabilities_raw = raw.get("capabilities", {})
+    if not isinstance(capabilities_raw, Mapping) or capabilities_raw.keys() - {"overrides"}:
+        raise SystemExit("capabilities: expected a table containing only 'overrides'")
+    capability_overrides = router_metadata.validate_overrides(capabilities_raw.get("overrides", {}))
     server_raw = raw.get("server") or {}
     if not isinstance(server_raw, Mapping):
         raise SystemExit("server: must be a table/object")
@@ -1005,13 +1134,36 @@ def build_config(raw: Mapping[str, Any]) -> Config:
             raise SystemExit(
                 "catalog: 'timeout' and 'refresh_seconds' must be numbers"
             ) from exc
-        if catalog_timeout <= 0 or catalog_refresh < 0:
+        if (not math.isfinite(catalog_timeout) or not math.isfinite(catalog_refresh)
+                or not 0 < catalog_timeout <= threading.TIMEOUT_MAX
+                or not 0 <= catalog_refresh <= threading.TIMEOUT_MAX):
             raise SystemExit(
-                "catalog: 'timeout' must be positive and 'refresh_seconds' >= 0"
+                "catalog: 'timeout' must be positive and 'refresh_seconds' >= 0; "
+                "both must be finite and <= threading.TIMEOUT_MAX"
             )
-        rules_raw = catalog_raw.get("rules") or []
-        if not isinstance(rules_raw, (list, tuple)) or not rules_raw:
-            raise SystemExit("catalog: at least one [[catalog.rules]] is required")
+        model_providers_raw = catalog_raw.get("model_providers", {})
+        if not isinstance(model_providers_raw, Mapping):
+            raise SystemExit("catalog.model_providers: must be a table/object")
+        model_providers: dict[str, str] = {}
+        for model_id, provider_name in model_providers_raw.items():
+            if (not isinstance(model_id, str) or not model_id.strip()
+                    or model_id != model_id.strip()):
+                raise SystemExit(
+                    "catalog.model_providers: model IDs must be nonempty strings "
+                    "without surrounding whitespace"
+                )
+            if not isinstance(provider_name, str) or provider_name not in providers:
+                raise SystemExit(
+                    f"catalog.model_providers[{model_id!r}]: unknown provider {provider_name!r}"
+                )
+            model_providers[model_id] = provider_name
+        rules_raw = catalog_raw.get("rules", [])
+        if not isinstance(rules_raw, (list, tuple)):
+            raise SystemExit("catalog.rules: must be an array")
+        if not rules_raw and not model_providers:
+            raise SystemExit(
+                "catalog: at least one model_providers entry or [[catalog.rules]] is required"
+            )
         rules: list[CatalogRule] = []
         for index, rule_raw in enumerate(rules_raw):
             where = f"catalog.rules[{index}]"
@@ -1029,6 +1181,9 @@ def build_config(raw: Mapping[str, Any]) -> Config:
             except re.error as exc:
                 raise SystemExit(f"{where}: invalid 'match' regex: {exc}") from exc
             rules.append(CatalogRule(pattern=pattern, provider_name=rule_provider))
+        metadata_source = catalog_raw.get("metadata_source")
+        if metadata_source not in (None, "opencode-go-v1"):
+            raise SystemExit("catalog.metadata_source: expected 'opencode-go-v1' or null")
         catalog = CatalogConfig(
             url=catalog_url,
             headers={
@@ -1038,6 +1193,8 @@ def build_config(raw: Mapping[str, Any]) -> Config:
             timeout=catalog_timeout,
             refresh_seconds=catalog_refresh,
             rules=rules,
+            model_providers=model_providers,
+            metadata_source=metadata_source,
         )
 
     models_raw = raw.get("models") or []
@@ -1122,6 +1279,7 @@ def build_config(raw: Mapping[str, Any]) -> Config:
         public_routes=public_routes,
         catalog=catalog,
         llama_cpp=llama_cpp,
+        capability_overrides=capability_overrides,
         **{name: server_raw.get(name, default) for name, default in (
             ("max_connections", DEFAULT_MAX_CONNECTIONS),
             ("max_generations", DEFAULT_MAX_GENERATIONS),
@@ -1305,56 +1463,129 @@ def _llama_mode(props: Any, rows: list[Mapping[str, Any]]) -> str:
     return "single"
 
 
-def _llama_context_from_args(args: Any) -> int | None:
-    """Read --ctx-size / --fit-ctx / -c from a model's launch arguments."""
+def _llama_arg(args: Any, flags: tuple[str, ...]) -> int | None:
+    """Read the last occurrence, including equals syntax; never execute args.
+
+    A final invalid/auto value must not revive an earlier positive value.
+    """
     if not isinstance(args, (list, tuple)):
         return None
-    values = [str(arg) for arg in args]
-    for flag in ("--ctx-size", "--fit-ctx", "-c"):
+    result = None
+    for index, arg in enumerate(args):
+        if not isinstance(arg, str):
+            continue
+        flag, sep, value = arg.partition("=")
+        if flag not in flags:
+            continue
+        if not sep:
+            value = args[index + 1] if index + 1 < len(args) else None
         try:
-            index = values.index(flag)
-        except ValueError:
-            continue
-        if index + 1 >= len(values):
-            continue
-        try:
-            parsed = int(float(values[index + 1]))
-        except ValueError:
-            continue
-        if parsed > 0:
-            return parsed
-    return None
+            result = int(value) if isinstance(value, str) and re.fullmatch(r"-?[0-9]+", value) else None
+        except ValueError:  # also rejects integer strings beyond Python's size guard
+            result = None
+    return result
 
 
-def _llama_context(
-    row: Mapping[str, Any], props: Any, mode: str, fallback: int
-) -> int:
-    """Resolve a model's context window from /v1/models and /props."""
-    meta = row.get("meta")
-    if mode in ("router", "single", "llama-swap") and isinstance(meta, Mapping):
-        n_ctx = meta.get("n_ctx")
-        if isinstance(n_ctx, (int, float)) and n_ctx > 0:
-            return int(n_ctx)
-    if mode == "router":
-        status = row.get("status")
-        if isinstance(status, Mapping):
-            parsed = _llama_context_from_args(status.get("args"))
-            if parsed:
-                return parsed
+def _llama_context_from_args(args: Any) -> int | None:
+    value = _llama_arg(args, ("--ctx-size", "-c"))
+    return value if value is not None and value > 0 else None
+
+
+def _limit_number(value: Any, *, minimum: int = 1) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    if isinstance(value, float) and (not math.isfinite(value) or not value.is_integer()):
+        return None
+    return int(value) if value >= minimum else None
+
+
+def _llama_limits(
+    row: Mapping[str, Any], props: Any, mode: str, fallback: int,
+    overrides: Mapping[str, int | None], *, per_model_props: bool = False,
+) -> dict[str, Any]:
+    """Keep reported runtime capacity, training metadata and defaults distinct.
+
+    Router/swap global props cannot describe any particular model. The caller
+    must explicitly identify props fetched for that model with autoload=false.
+    """
+    def mapping(value: Any) -> Mapping[str, Any]:
+        return value if isinstance(value, Mapping) else {}
+
+    meta = mapping(row.get("meta"))
+    metadata = mapping(row.get("metadata"))
+    props = mapping(props) if mode in ("single", "legacy") or per_model_props else {}
+    props_source = "/props?model=<id>" if per_model_props else "/props"
+    defaults = mapping(props.get("default_generation_settings"))
+    params = mapping(defaults.get("params"))
+    args = mapping(row.get("status")).get("args")
+    result: dict[str, Any] = {
+        key: {"value": None, "source": None, "kind": "unknown"}
+        for key in LLAMA_LIMIT_FIELDS
+    }
+
+    def choose(key: str, candidates: list[tuple[Any, str]], *, minimum: int = 1) -> None:
+        for raw, source in candidates:
+            value = _limit_number(raw, minimum=minimum)
+            if value is not None:
+                result[key] = {"value": value, "source": source, "kind": "reported"}
+                return
+
+    context = [(meta.get("n_ctx"), "/v1/models.meta.n_ctx")]
     if mode == "legacy":
-        max_model_len = row.get("max_model_len")
-        if isinstance(max_model_len, (int, float)) and max_model_len > 0:
-            return int(max_model_len)
-        if isinstance(props, Mapping):
-            n_ctx = props.get("n_ctx")
-            if isinstance(n_ctx, (int, float)) and n_ctx > 0:
-                return int(n_ctx)
-            defaults = props.get("default_generation_settings")
-            if isinstance(defaults, Mapping):
-                n_ctx = defaults.get("n_ctx")
-                if isinstance(n_ctx, (int, float)) and n_ctx > 0:
-                    return int(n_ctx)
-    return fallback
+        context.insert(0, (row.get("max_model_len"), "/v1/models.max_model_len"))
+    choose("context_window", context + [
+        (defaults.get("n_ctx"), props_source + ".default_generation_settings.n_ctx"),
+        (props.get("n_ctx"), props_source + ".n_ctx"),
+    ])
+    if result["context_window"]["value"] is None:
+        requested = _llama_context_from_args(args)
+        result["context_window"] = (
+            {"value": requested, "source": "/v1/models.status.args.ctx-size", "kind": "inferred"}
+            if requested is not None else
+            {"value": fallback, "source": "llama_cpp.context_fallback", "kind": "fallback"}
+        )
+    choose("trained_context_window", [
+        (meta.get("n_ctx_train"), "/v1/models.meta.n_ctx_train"),
+        # llama.cpp router listings use context_length for trained capacity.
+        (row.get("context_length") if mode == "router" else None, "/v1/models.context_length"),
+        (props.get("n_ctx_train"), props_source + ".n_ctx_train"),
+    ])
+    # These names explicitly denote hard limits. Ambiguous max_tokens and
+    # n_predict are never promoted to maximum output capacity.
+    for key in ("max_input_tokens", "max_output_tokens"):
+        choose(key, [(meta.get(key), "/v1/models.meta." + key),
+                     (row.get(key), "/v1/models." + key),
+                     (metadata.get(key), "/v1/models.metadata." + key),
+                     (props.get(key), props_source + "." + key)])
+
+    for raw, source in [
+        (params.get("n_predict"), props_source + ".default_generation_settings.params.n_predict"),
+        (defaults.get("n_predict"), props_source + ".default_generation_settings.n_predict"),
+        (params.get("max_tokens"), props_source + ".default_generation_settings.params.max_tokens"),
+        (defaults.get("max_tokens"), props_source + ".default_generation_settings.max_tokens"),
+        (_llama_arg(args, ("--predict", "--n-predict", "-n")), "/v1/models.status.args.n-predict"),
+    ]:
+        value = _limit_number(raw, minimum=-2)
+        if value is None:
+            continue
+        result["default_output_tokens"] = {
+            "value": value if value >= 0 else None, "source": source,
+            "kind": "inferred" if source.startswith("/v1/models.status.args") else "reported",
+        }
+        if value < 0:
+            result["default_output_tokens"]["special"] = "unlimited" if value == -1 else "until_context"
+        break
+
+    for key, value in overrides.items():
+        result[key] = {"value": value, "source": "llama_cpp.limit_overrides", "kind": "override"}
+
+    fit = _llama_arg(args, ("--fit-ctx", "-fitc"))
+    result["constraints"] = {}
+    if fit is not None and fit > 0:
+        result["constraints"]["fit_context_min"] = {
+            "value": fit, "source": "/v1/models.status.args.fit-ctx", "kind": "constraint",
+        }
+    return result
 
 
 def _llama_capabilities(row: Mapping[str, Any], mode: str) -> list[str]:
@@ -1390,7 +1621,7 @@ def _llama_model_aliases(row: Mapping[str, Any]) -> list[str]:
 
 
 def _llama_provider_name(server: LlamaCppServer, taken: set[str]) -> str:
-    """A stable provider name for a discovered server."""
+    """Choose a generated name against identities reserved before probing."""
     if server.name:
         base = server.name
     else:
@@ -1405,14 +1636,56 @@ def _llama_provider_name(server: LlamaCppServer, taken: set[str]) -> str:
     return name
 
 
+def _llama_provider_names(config: Config) -> dict[str, str]:
+    """Reserve explicit names first, then generated names in config order."""
+    if config.llama_cpp is None:
+        return {}
+    taken = set(config.providers)
+    explicit: dict[str, int] = {}
+    for index, server in enumerate(config.llama_cpp.servers):
+        if not server.name:
+            continue
+        where = f"llama_cpp.servers[{index}].name"
+        if server.name in explicit:
+            raise SystemExit(
+                f"{where}: duplicate explicit provider name {server.name!r}; "
+                f"already used by llama_cpp.servers[{explicit[server.name]}]. "
+                "Assign each server a unique name or omit names to generate them."
+            )
+        if server.name in config.providers:
+            raise SystemExit(
+                f"{where}: provider name {server.name!r} is already configured "
+                "in providers; choose a unique server name or omit it."
+            )
+        explicit[server.name] = index
+        taken.add(server.name)
+    names: dict[str, str] = {}
+    for server in config.llama_cpp.servers:
+        name = server.name or _llama_provider_name(server, taken)
+        names[server.url] = name
+        taken.add(name)
+    return names
+
+
 def _llama_base_url(url: str) -> str:
     """The OpenAI-compatible base URL of a llama.cpp server."""
     return url if url.endswith("/v1") else url + "/v1"
 
 
 class App:
-    def __init__(self, config: Config) -> None:
+    def __init__(
+        self, config: Config, *, clock: Callable[[], float] = time.monotonic,
+        jitter: Callable[[float, float], float] = random.uniform,
+    ) -> None:
         self.config = config
+        self._clock = clock
+        self._jitter = jitter
+        self._closed = threading.Event()
+        self._close_lock = threading.Lock()
+        self._worker_lock = threading.Lock()
+        self._worker_stop = threading.Event()
+        self._refresh_wakeup = threading.Event()
+        self._refresh_worker: threading.Thread | None = None
         self.sanitize = ErrorSanitizer(_config_secrets(config))
         self._log_filter = _DiagnosticLogFilter(self.sanitize)
         # Logger filters do not propagate to children. Include the dependency
@@ -1430,28 +1703,154 @@ class App:
             limits=httpx.Limits(max_connections=200, max_keepalive_connections=50),
         )
         self.verbose = False
+        self._registry_lock = threading.Lock()
+        self._llama_names = _llama_provider_names(config)
+        self._registry = RegistrySnapshot(
+            providers=_freeze({}), routes=_freeze({}), public=(),
+            catalog=CatalogSnapshot(), llama=LlamaSnapshot(),
+        )
+        self._publish_registry()
         self._catalog_lock = threading.Lock()
-        self._catalog_routes: dict[str, Route] = {}
-        self._catalog_updated = 0.0
-        self._catalog_attempted = 0.0
-        self._catalog_error: str | None = None
         self._llama_lock = threading.Lock()
-        self._llama_providers: dict[str, Provider] = {}
-        self._llama_routes: dict[str, Route] = {}
-        self._llama_public: list[Route] = []
-        self._llama_by_server: dict[
-            str, tuple[Provider, dict[str, Route], list[Route]]
-        ] = {}
-        self._llama_servers_state: list[dict[str, Any]] = []
-        self._llama_updated = 0.0
-        self._llama_attempted = 0.0
-        self._llama_error: str | None = None
         self._llama_unreachable: set[str] = set()
         self._llama_counts: dict[str, int] = {}
-        if config.llama_cpp is not None:
+        # One synchronous initial inventory preserves startup/--check behavior.
+        # No background thread is owned until start() (or serve()) is called.
+        try:
             self.refresh_llama_cpp(force=True)
-        if config.catalog is not None:
             self.refresh_catalog(force=True)
+        except BaseException:
+            self.close()
+            raise
+
+    def start(self) -> None:
+        """Start scheduled discovery. Idempotent; serve() calls this after bind."""
+        with self._worker_lock:
+            if self._closed.is_set():
+                raise RuntimeError("Cannot start a closed router")
+            if self._refresh_worker is not None:
+                return
+            if not any(source and source.refresh_seconds > 0
+                       for source in (self.config.catalog, self.config.llama_cpp)):
+                return
+            self._worker_stop.clear()
+            self._refresh_worker = threading.Thread(
+                target=self._run_refresh_worker, name="model-router-discovery", daemon=False,
+            )
+            try:
+                self._refresh_worker.start()
+            except BaseException:
+                self._refresh_worker = None
+                raise
+
+    def stop(self) -> None:
+        """Stop scheduling and join active discovery before returning.
+
+        An active HTTP probe finishes under its configured timeout. start() can
+        resume scheduling after stop(); close() permanently releases resources.
+        """
+        with self._worker_lock:
+            self._worker_stop.set()
+            self._refresh_wakeup.set()
+            if self._refresh_worker is not None:
+                self._refresh_worker.join()
+                self._refresh_worker = None
+
+    def _run_refresh_worker(self) -> None:
+        while not self._worker_stop.is_set():
+            self._refresh_wakeup.clear()
+            for refresh in (self.refresh_llama_cpp, self.refresh_catalog):
+                if self._worker_stop.is_set():
+                    return
+                refresh()
+            snapshot = self._registry
+            # A manual refresh may own a source. Its completion wakes us;
+            # exclude its old deadline so an overdue attempt cannot spin here.
+            deadlines = [state.refresh.next_attempt
+                         for state, lock in ((snapshot.catalog, self._catalog_lock),
+                                             (snapshot.llama, self._llama_lock))
+                         if state.refresh.next_attempt is not None and not lock.locked()]
+            delay = max(0.0, min(deadlines) - self._clock()) if deadlines else None
+            self._refresh_wakeup.wait(
+                min(delay, threading.TIMEOUT_MAX) if delay is not None else None
+            )
+
+    def _next_refresh(
+        self, previous: RefreshState, interval: float, attempted: float, *, failed: bool,
+    ) -> RefreshState:
+        completed = self._clock()
+        failures = previous.consecutive_failures + 1 if failed else 0
+        if failed:
+            ceiling = min(REFRESH_BACKOFF_MAX,
+                          REFRESH_BACKOFF_BASE * 2 ** min(failures - 1, 16))
+            delay = self._jitter(ceiling / 2, ceiling)
+        else:
+            delay = interval
+        return RefreshState(
+            last_success=previous.last_success if failed else completed,
+            last_attempt=attempted,
+            next_attempt=completed + delay if interval > 0 else None,
+            consecutive_failures=failures,
+        )
+
+    def _refresh_status(
+        self, state: RefreshState, interval: float, error: str | None, now: float,
+    ) -> dict[str, Any]:
+        age = max(0.0, now - state.last_success) if state.last_success is not None else None
+        return {
+            "last_success": state.last_success,
+            "last_attempt": state.last_attempt,
+            "next_attempt": state.next_attempt,
+            "consecutive_failures": state.consecutive_failures,
+            "age_seconds": age,
+            "stale": state.last_success is None or error is not None
+                     or (interval > 0 and age is not None and age >= interval),
+            "stale_age_seconds": (max(0.0, age - interval) if interval > 0 else 0.0)
+                                 if age is not None else None,
+        }
+
+    def _publish_registry(
+        self, *, catalog: CatalogSnapshot | None = None,
+        llama: LlamaSnapshot | None = None,
+    ) -> None:
+        """Merge the latest source generations and publish one immutable value.
+
+        Discovery source locks serialize their own network work. This short
+        lock prevents simultaneous catalog/local publications losing updates;
+        request dispatch never holds it, including during upstream I/O.
+        """
+        with self._registry_lock:
+            previous = self._registry
+            catalog = catalog if catalog is not None else previous.catalog
+            llama = llama if llama is not None else previous.llama
+            providers = {**self.config.providers, **llama.providers}
+            bound: dict[int, Route] = {}
+
+            def bind(route: Route) -> Route:
+                if id(route) not in bound:
+                    bound[id(route)] = replace(
+                        route, _provider=providers[route.provider_name]
+                    )
+                return bound[id(route)]
+
+            routes = {**catalog.routes, **llama.routes, **self.config.routes}
+            public: list[Route] = []
+            # Explicit aliases also reserve names against public discovery.
+            names: set[str] = set()
+            for source, entries in (
+                (self.config.routes, self.config.public_routes),
+                (llama.routes, llama.public),
+                (catalog.routes, catalog.routes.values()),
+            ):
+                for route in entries:
+                    if route.enabled and route.name not in names:
+                        public.append(bind(route))
+                names.update(source)
+            self._registry = RegistrySnapshot(
+                providers=_freeze(providers),
+                routes=_freeze({name: bind(route) for name, route in routes.items()}),
+                public=tuple(public), catalog=catalog, llama=llama,
+            )
 
     # -- auth / inventory -------------------------------------------------
 
@@ -1475,123 +1874,135 @@ class App:
         )
 
     def _catalog_is_stale(self) -> bool:
-        catalog = self.config.catalog
-        if catalog is None:
-            return False
-        now = time.monotonic()
-        if self._catalog_updated == 0.0:
-            # Never succeeded; retry occasionally instead of on every request.
-            return now - self._catalog_attempted >= max(catalog.refresh_seconds, 30.0)
-        if catalog.refresh_seconds <= 0:
-            return False  # startup-only catalog
-        return now - self._catalog_updated >= catalog.refresh_seconds
+        deadline = self._registry.catalog.refresh.next_attempt
+        return deadline is not None and self._clock() >= deadline
 
     def refresh_catalog(self, *, force: bool = False) -> None:
-        """Fetch the configured model catalog and rebuild its routes."""
+        """Explicit refresh; overlapping calls return immediately, even if forced."""
         catalog = self.config.catalog
-        if catalog is None:
+        if catalog is None or not self._catalog_lock.acquire(blocking=False):
             return
-        with self._catalog_lock:
-            if not force and not self._catalog_is_stale():
+        try:
+            if self._closed.is_set() or (not force and not self._catalog_is_stale()):
                 return
-            request_headers = {"User-Agent": f"litellm-model-router/{__version__}"}
-            request_headers.update(catalog.headers)
+            previous = self._registry.catalog
+            attempted = self._clock()
             try:
-                response = self.http.get(
-                    catalog.url,
-                    headers=request_headers,
-                    timeout=httpx.Timeout(catalog.timeout, connect=catalog.timeout),
-                )
-                response.raise_for_status()
-                payload = response.json()
-            except Exception as exc:  # noqa: BLE001 - catalog is best-effort
-                self._catalog_error = _error_message(exc, self.sanitize)
-                self._catalog_attempted = time.monotonic()
-                LOG.warning("Model catalog refresh failed: %s", self._catalog_error)
-                return
+                self._load_catalog(catalog, previous, attempted)
+            except Exception as exc:  # noqa: BLE001 - discovery is best-effort
+                error = _error_message(exc, self.sanitize)
+                self._publish_registry(catalog=replace(
+                    previous, error=error,
+                    refresh=self._next_refresh(previous.refresh, catalog.refresh_seconds,
+                                               attempted, failed=True),
+                ))
+                LOG.warning("Model catalog refresh failed: %s", error)
+        finally:
+            self._catalog_lock.release()
+            if threading.current_thread() is not self._refresh_worker:
+                self._refresh_wakeup.set()
 
-            rows = payload.get("data") if isinstance(payload, Mapping) else payload
-            if not isinstance(rows, list):
-                self._catalog_error = "catalog response has no model list"
-                self._catalog_attempted = time.monotonic()
-                LOG.warning("Model catalog %s has no model list", catalog.url)
-                return
+    def _load_catalog(
+        self, catalog: CatalogConfig, previous: CatalogSnapshot, attempted: float,
+    ) -> None:
+        request_headers = {"User-Agent": f"litellm-model-router/{__version__}"}
+        request_headers.update(catalog.headers)
+        response = self.http.get(
+            catalog.url,
+            headers=request_headers,
+            timeout=httpx.Timeout(catalog.timeout, connect=catalog.timeout),
+        )
+        response.raise_for_status()
+        payload = response.json()
+        rows = payload.get("data") if isinstance(payload, Mapping) else payload
+        if not isinstance(rows, list):
+            raise ValueError("catalog response has no model list")
 
-            routes: dict[str, Route] = {}
-            for row in rows:
-                if isinstance(row, Mapping):
-                    model_id = row.get("id")
-                    metadata = row.get("metadata")
-                else:
-                    model_id = row
-                    metadata = None
-                if not isinstance(model_id, str) or not model_id.strip():
-                    continue
-                model_id = model_id.strip()
+        routes: dict[str, Route] = {}
+        unmapped: set[str] = set()
+        for row in rows:
+            if isinstance(row, Mapping):
+                model_id = row.get("id")
+                metadata = row.get("metadata")
+            else:
+                model_id = row
+                metadata = None
+            if not isinstance(model_id, str) or not model_id.strip():
+                continue
+            model_id = model_id.strip()
+            provider_name = catalog.model_providers.get(model_id)
+            if provider_name is None:
                 for rule in catalog.rules:
-                    if not rule.pattern.search(model_id):
-                        continue
-                    provider = self.config.providers[rule.provider_name]
-                    routes[model_id] = Route(
-                        name=model_id,
-                        provider_name=rule.provider_name,
-                        upstream_model=model_id,
-                        dialect=provider.dialect,
-                        metadata=dict(metadata) if isinstance(metadata, Mapping) else {},
-                    )
-                    break
-
-            if not routes:
-                self._catalog_error = "catalog matched no models"
-                self._catalog_attempted = time.monotonic()
-                LOG.warning("Model catalog %s matched no models", catalog.url)
-                return
-            self._catalog_routes = routes
-            self._catalog_updated = time.monotonic()
-            self._catalog_attempted = self._catalog_updated
-            self._catalog_error = None
-            LOG.info(
-                "Model catalog loaded %d models from %s", len(routes), catalog.url
+                    if rule.pattern.search(model_id):
+                        provider_name = rule.provider_name
+                        break
+            if provider_name is None:
+                unmapped.add(model_id)
+                continue
+            provider = self.config.providers[provider_name]
+            capabilities = (router_metadata.go(model_id, provider.dialect)
+                            if catalog.metadata_source == "opencode-go-v1"
+                            else router_metadata.empty(provider.dialect))
+            capabilities["sources"]["catalog"] = {
+                "retrieved_at": time.time(), "verification": "availability only",
+            }
+            routes[model_id] = Route(
+                name=model_id,
+                provider_name=provider_name,
+                upstream_model=model_id,
+                dialect=provider.dialect,
+                metadata=dict(metadata) if isinstance(metadata, Mapping) else {},
+                _capabilities=capabilities,
             )
 
-    def _refresh_catalog_if_stale(self) -> None:
-        if self._catalog_is_stale():
-            self.refresh_catalog()
+        # A valid catalog containing only unreviewed IDs is a successful
+        # empty routing inventory, not a reason to retain removed routes.
+        self._publish_registry(catalog=CatalogSnapshot(
+            routes=_freeze(routes), unmapped=frozenset(unmapped),
+            refresh=self._next_refresh(previous.refresh, catalog.refresh_seconds,
+                                       attempted, failed=False),
+        ))
+        unmapped = set(self.catalog_status()["unmapped_models"])
+        if unmapped:
+            LOG.warning(
+                "Catalog has %d model(s) with unknown endpoint mapping; "
+                "omitted from /v1/models: %s. Configure catalog.model_providers "
+                "or an explicit [[models]] route after reviewing the endpoint.",
+                len(unmapped), ", ".join(sorted(unmapped)),
+            )
+        LOG.info(
+            "Model catalog loaded %d models from %s", len(routes), catalog.url
+        )
 
-    def catalog_status(self) -> dict[str, Any]:
+    def catalog_status(self, snapshot: RegistrySnapshot | None = None) -> dict[str, Any]:
+        snapshot = snapshot if snapshot is not None else self._registry
+        state = snapshot.catalog
         catalog = self.config.catalog
         return {
             "enabled": catalog is not None,
             "url": self.sanitize(catalog.url) if catalog else None,
-            "models": len(self._catalog_routes),
-            "loaded": self._catalog_updated != 0.0,
-            "error": self._catalog_error,
+            "models": len(state.routes),
+            "loaded": state.refresh.last_success is not None,
+            "error": state.error,
+            "refresh": self._refresh_status(state.refresh, catalog.refresh_seconds if catalog else 0,
+                                            state.error, self._clock()),
+            "unmapped_models": sorted(
+                state.unmapped - snapshot.routes.keys()
+            ),
         }
 
     # -- llama.cpp auto-discovery -----------------------------------------
 
     def provider(self, name: str) -> Provider:
-        """Look up a static provider, then a discovered llama.cpp one."""
-        provider = self.config.providers.get(name)
-        if provider is not None:
-            return provider
-        return self._llama_providers[name]
+        """Look up a provider in the current snapshot (resolved routes pin theirs)."""
+        return self._registry.providers[name]
 
     def provider_count(self) -> int:
-        return len(self.config.providers) + len(self._llama_providers)
+        return len(self._registry.providers)
 
     def _llama_is_stale(self) -> bool:
-        llama = self.config.llama_cpp
-        if llama is None:
-            return False
-        now = time.monotonic()
-        if self._llama_updated == 0.0:
-            # Nothing has been discovered yet; retry periodically so servers
-            # started after the router are picked up.
-            return now - self._llama_attempted >= max(llama.refresh_seconds, 15.0)
-        if llama.refresh_seconds <= 0:
-            return False  # startup-only discovery
-        return now - self._llama_updated >= llama.refresh_seconds
+        deadline = self._registry.llama.refresh.next_attempt
+        return deadline is not None and self._clock() >= deadline
 
     def _probe_llama_server(
         self, llama: LlamaCppConfig, server: LlamaCppServer
@@ -1642,10 +2053,37 @@ class App:
         if not isinstance(rows, list):
             return {"server": server, "error": "response has no model list"}
 
+        rows = [row for row in rows if isinstance(row, Mapping)]
+        model_props: dict[str, Mapping[str, Any]] = {}
+        if _llama_mode(props, rows) == "router":
+            for row in rows:
+                model_id = row.get("id")
+                status = row.get("status")
+                if (not isinstance(model_id, str) or not model_id.strip()
+                        or not isinstance(status, Mapping)
+                        or status.get("value") not in ("loaded", "sleeping")):
+                    continue
+                try:
+                    response = self.http.get(
+                        base + "/props", params={"model": model_id, "autoload": "false"},
+                        headers=headers, timeout=timeout,
+                    )
+                    if response.status_code < 400:
+                        value = response.json()
+                        # Older routers may ignore the model query and return
+                        # their global router props. Those are not model data.
+                        if (isinstance(value, Mapping)
+                                and value.get("role") != "router"
+                                and value.get("src") != "llama-swap"):
+                            model_props[model_id.strip()] = value
+                except Exception:  # noqa: BLE001 - older servers may lack per-model props
+                    pass
+
         return {
             "server": server,
-            "rows": [row for row in rows if isinstance(row, Mapping)],
+            "rows": rows,
             "props": props,
+            "model_props": model_props,
         }
 
     def _log_llama_probe(
@@ -1676,231 +2114,295 @@ class App:
         llama = self.config.llama_cpp
         if llama is None:
             return
-        with self._llama_lock:
-            if not force and not self._llama_is_stale():
+        if not self._llama_lock.acquire(blocking=False):
+            return
+        try:
+            if self._closed.is_set() or (not force and not self._llama_is_stale()):
                 return
-            self._llama_attempted = time.monotonic()
+            attempted = self._clock()
+            previous = self._registry.llama
+            try:
+                self._load_llama_cpp(llama, previous, attempted)
+            except Exception as exc:  # noqa: BLE001 - retain last usable inventory
+                error = _error_message(exc, self.sanitize)
+                self._publish_registry(llama=replace(
+                    previous, error=error,
+                    refresh=self._next_refresh(previous.refresh, llama.refresh_seconds,
+                                               attempted, failed=True),
+                ))
+                LOG.warning("llama.cpp discovery failed: %s", error)
+        finally:
+            self._llama_lock.release()
+            if threading.current_thread() is not self._refresh_worker:
+                self._refresh_wakeup.set()
 
-            outcomes: list[dict[str, Any] | None] = [None] * len(llama.servers)
-            if llama.servers:
-                workers = min(8, len(llama.servers))
-                with ThreadPoolExecutor(max_workers=workers) as pool:
-                    futures = {
-                        pool.submit(self._probe_llama_server, llama, server): index
-                        for index, server in enumerate(llama.servers)
-                    }
-                    for future in as_completed(futures):
-                        index = futures[future]
-                        try:
-                            outcomes[index] = future.result()
-                        except Exception as exc:  # noqa: BLE001
-                            outcomes[index] = {
-                                "server": llama.servers[index],
-                                "error": _error_message(exc, self.sanitize),
-                            }
-
-            explicit_names = set(self.config.routes)
-            taken = set(self.config.providers)
-            providers: dict[str, Provider] = {}
-            routes: dict[str, Route] = {}
-            public: list[Route] = []
-            by_server: dict[
-                str, tuple[Provider, dict[str, Route], list[Route]]
-            ] = {}
-            states: list[dict[str, Any]] = []
-            errors: list[str] = []
-            reachable = 0
-
-            for index, server in enumerate(llama.servers):
-                outcome = outcomes[index]
-                if outcome is None or outcome.get("error"):
-                    error = self.sanitize(
-                        outcome["error"]
-                        if outcome and outcome.get("error")
-                        else "probe failed"
-                    )
-                    # Keep the last good routes for this server during a
-                    # transient failure instead of dropping them.
-                    previous = self._llama_by_server.get(server.url)
-                    if previous is not None:
-                        old_provider, old_routes, old_public = previous
-                        taken.add(old_provider.name)
-                        providers[old_provider.name] = old_provider
-                        for public_name, route in old_routes.items():
-                            if (
-                                public_name not in explicit_names
-                                and public_name not in routes
-                            ):
-                                routes[public_name] = route
-                        known = {route.name for route in public}
-                        for route in old_public:
-                            if (
-                                route.name not in explicit_names
-                                and route.name not in known
-                            ):
-                                public.append(route)
-                                known.add(route.name)
-                        by_server[server.url] = previous
-                        model_count = len(old_public)
-                    else:
-                        model_count = 0
-                    self._log_llama_probe(server, error, model_count)
-                    errors.append(self.sanitize(f"{server.url}: {error}"))
-                    states.append(
-                        {
-                            "url": server.url,
-                            "reachable": False,
-                            "mode": None,
-                            "models": model_count,
-                            "stale": previous is not None,
-                            "error": error,
+    def _load_llama_cpp(
+        self, llama: LlamaCppConfig, previous_state: LlamaSnapshot, attempted: float,
+    ) -> None:
+        outcomes: list[dict[str, Any] | None] = [None] * len(llama.servers)
+        if llama.servers:
+            workers = min(8, len(llama.servers))
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                futures = {
+                    pool.submit(self._probe_llama_server, llama, server): index
+                    for index, server in enumerate(llama.servers)
+                }
+                for future in as_completed(futures):
+                    index = futures[future]
+                    try:
+                        outcomes[index] = future.result()
+                    except Exception as exc:  # noqa: BLE001
+                        outcomes[index] = {
+                            "server": llama.servers[index],
+                            "error": _error_message(exc, self.sanitize),
                         }
-                    )
-                    continue
 
-                reachable += 1
-                rows = outcome["rows"]
-                props = outcome["props"]
-                mode = _llama_mode(props, rows)
-                provider_name = _llama_provider_name(server, taken)
-                taken.add(provider_name)
-                provider = Provider(
-                    name=provider_name,
-                    dialect=DIALECT_OPENAI_CHAT,
-                    base_url=_llama_base_url(server.url),
-                    api_key=server.api_key,
-                    headers={**llama.headers, **server.headers},
-                    timeout=DEFAULT_TIMEOUT,
-                    litellm_provider="openai",
-                    litellm_kwargs={},
-                    drop_params=True,
+        explicit_names = set(self.config.routes)
+        providers: dict[str, Provider] = {}
+        routes: dict[str, Route] = {}
+        public: list[Route] = []
+        by_server: dict[
+            str, tuple[Provider, Mapping[str, Route], tuple[Route, ...]]
+        ] = {}
+        states: list[dict[str, Any]] = []
+        errors: list[str] = []
+        reachable = 0
+        previous_servers = {server["url"]: server for server in previous_state.servers}
+
+        for index, server in enumerate(llama.servers):
+            outcome = outcomes[index]
+            if outcome is None or outcome.get("error"):
+                error = self.sanitize(
+                    outcome["error"]
+                    if outcome and outcome.get("error")
+                    else "probe failed"
                 )
-                providers[provider_name] = provider
-                server_routes: dict[str, Route] = {}
-                server_public: list[Route] = []
-                alias_candidates: list[tuple[list[str], Route]] = []
-
-                for row in rows:
-                    model_id = row.get("id")
-                    if not isinstance(model_id, str) or not model_id.strip():
-                        continue
-                    model_id = model_id.strip()
-                    aliases = _llama_model_aliases(row)
-                    display_name = aliases[0] if aliases else model_id
-                    context = _llama_context(
-                        row, props, mode, llama.context_fallback
-                    )
-                    capabilities = _llama_capabilities(row, mode)
-                    status = row.get("status")
-                    status_value = (
-                        status.get("value") if isinstance(status, Mapping) else None
-                    )
-                    if status_value is None and mode in ("single", "legacy"):
-                        # These servers only ever run one loaded model.
-                        status_value = "loaded"
-                    metadata = (
-                        dict(row["metadata"])
-                        if isinstance(row.get("metadata"), Mapping)
-                        else {}
-                    )
-                    metadata.update(
-                        {
-                            "display_name": display_name,
-                            "context_window": context,
-                            "max_tokens": context,
-                            "capabilities": capabilities,
-                            "llama_cpp": {
-                                "server": server.url,
-                                "mode": mode,
-                                "status": status_value,
-                                "n_ctx": context,
-                            },
-                        }
-                    )
-                    public_name = llama.prefix + model_id
-                    if (
-                        public_name in explicit_names
-                        or public_name in routes
-                        or public_name in server_routes
-                    ):
-                        continue
-                    route = Route(
-                        name=public_name,
-                        provider_name=provider_name,
-                        upstream_model=model_id,
-                        dialect=DIALECT_OPENAI_CHAT,
-                        metadata=metadata,
-                    )
-                    server_routes[public_name] = route
-                    routes[public_name] = route
-                    public.append(route)
-                    server_public.append(route)
-                    if llama.expose_aliases and aliases:
-                        alias_candidates.append((aliases, route))
-
-                for aliases, route in alias_candidates:
-                    for alias in aliases:
-                        public_alias = llama.prefix + alias
+                # Keep the last good routes for this server during a
+                # transient failure instead of dropping them.
+                previous = previous_state.by_server.get(server.url)
+                if previous is not None:
+                    old_provider, old_routes, old_public = previous
+                    providers[old_provider.name] = old_provider
+                    for public_name, route in old_routes.items():
                         if (
-                            public_alias in explicit_names
-                            or public_alias in routes
-                            or public_alias in server_routes
+                            public_name not in explicit_names
+                            and public_name not in routes
                         ):
-                            continue
-                        server_routes[public_alias] = route
-                        routes[public_alias] = route
-
-                by_server[server.url] = (
-                    provider,
-                    server_routes,
-                    server_public,
-                )
-                self._log_llama_probe(server, None, len(server_public))
+                            routes[public_name] = route
+                    known = {route.name for route in public}
+                    for route in old_public:
+                        if (
+                            route.name not in explicit_names
+                            and route.name not in known
+                        ):
+                            public.append(route)
+                            known.add(route.name)
+                    by_server[server.url] = previous
+                    model_count = len(old_public)
+                else:
+                    model_count = 0
+                self._log_llama_probe(server, error, model_count)
+                errors.append(self.sanitize(f"{server.url}: {error}"))
                 states.append(
                     {
                         "url": server.url,
-                        "reachable": True,
-                        "mode": mode,
-                        "provider": provider_name,
-                        "models": len(server_public),
-                        "stale": False,
-                        "error": None,
+                        "reachable": False,
+                        "mode": None,
+                        "provider": self._llama_names[server.url],
+                        "models": model_count,
+                        "stale": previous is not None,
+                        "error": error,
+                        "last_success": previous_servers.get(server.url, {}).get("last_success"),
+                        "last_attempt": attempted,
                     }
                 )
+                continue
 
-            self._llama_providers = providers
-            self._llama_routes = routes
-            self._llama_public = public
-            self._llama_by_server = by_server
-            self._llama_servers_state = states
-            self._llama_error = self.sanitize("; ".join(errors)) if errors else None
-            if reachable:
-                self._llama_updated = time.monotonic()
-            LOG.debug(
-                "llama.cpp discovery: %d server(s) reachable, %d model route(s)",
-                reachable,
-                len(public),
+            reachable += 1
+            rows = outcome["rows"]
+            props = outcome["props"]
+            mode = _llama_mode(props, rows)
+            provider_name = self._llama_names[server.url]
+            provider = Provider(
+                name=provider_name,
+                dialect=DIALECT_OPENAI_CHAT,
+                base_url=_llama_base_url(server.url),
+                api_key=server.api_key,
+                headers={**llama.headers, **server.headers},
+                timeout=DEFAULT_TIMEOUT,
+                litellm_provider="openai",
+                litellm_kwargs={},
+                drop_params=False,
+            )
+            providers[provider_name] = provider
+            server_routes: dict[str, Route] = {}
+            server_public: list[Route] = []
+            alias_candidates: list[tuple[list[str], Route]] = []
+
+            for row in rows:
+                model_id = row.get("id")
+                if not isinstance(model_id, str) or not model_id.strip():
+                    continue
+                model_id = model_id.strip()
+                aliases = _llama_model_aliases(row)
+                display_name = aliases[0] if aliases else model_id
+                model_props = outcome.get("model_props", {})
+                per_model_props = model_id in model_props
+                limits = _llama_limits(
+                    row, model_props[model_id] if per_model_props else props,
+                    mode, llama.context_fallback, llama.limit_overrides.get(model_id, {}),
+                    per_model_props=per_model_props,
+                )
+                context = limits["context_window"]["value"]
+                capabilities = _llama_capabilities(row, mode)
+                status = row.get("status")
+                status_value = (
+                    status.get("value") if isinstance(status, Mapping) else None
+                )
+                if status_value is None and mode in ("single", "legacy"):
+                    # These servers only ever run one loaded model.
+                    status_value = "loaded"
+                metadata = (
+                    dict(row["metadata"])
+                    if isinstance(row.get("metadata"), Mapping)
+                    else {}
+                )
+                metadata.update(
+                    {
+                        "display_name": display_name,
+                        "context_window": context,
+                        # Compatibility alias: maximum generation length only.
+                        # null means unknown, never the context or a default.
+                        "max_tokens": limits["max_output_tokens"]["value"],
+                        "limits": limits,
+                        "capabilities": capabilities,
+                        "llama_cpp": {
+                            "server": server.url,
+                            "mode": mode,
+                            "status": status_value,
+                            "n_ctx": context,
+                        },
+                    }
+                )
+                for key in LLAMA_LIMIT_FIELDS:
+                    metadata[key] = limits[key]["value"]
+                public_name = llama.prefix + model_id
+                if (
+                    public_name in explicit_names
+                    or public_name in routes
+                    or public_name in server_routes
+                ):
+                    continue
+                route = Route(
+                    name=public_name,
+                    provider_name=provider_name,
+                    upstream_model=model_id,
+                    dialect=DIALECT_OPENAI_CHAT,
+                    metadata=metadata,
+                    _capabilities=router_metadata.llama(
+                        row, model_props[model_id] if per_model_props else props,
+                        mode, limits, time.time(), per_model_props=per_model_props,
+                    ),
+                )
+                server_routes[public_name] = route
+                routes[public_name] = route
+                public.append(route)
+                server_public.append(route)
+                if llama.expose_aliases and aliases:
+                    alias_candidates.append((aliases, route))
+
+            for aliases, route in alias_candidates:
+                for alias in aliases:
+                    public_alias = llama.prefix + alias
+                    if (
+                        public_alias in explicit_names
+                        or public_alias in routes
+                        or public_alias in server_routes
+                    ):
+                        continue
+                    server_routes[public_alias] = route
+                    routes[public_alias] = route
+
+            by_server[server.url] = (
+                provider,
+                server_routes,
+                tuple(server_public),
+            )
+            self._log_llama_probe(server, None, len(server_public))
+            states.append(
+                {
+                    "url": server.url,
+                    "reachable": True,
+                    "mode": mode,
+                    "provider": provider_name,
+                    "models": len(server_public),
+                    "stale": False,
+                    "error": None,
+                    "last_success": self._clock(),
+                    "last_attempt": attempted,
+                }
             )
 
-    def _refresh_llama_cpp_if_stale(self) -> None:
-        if self._llama_is_stale():
-            self.refresh_llama_cpp()
+        self._publish_registry(llama=LlamaSnapshot(
+            providers=_freeze(providers), routes=_freeze(routes),
+            public=tuple(public), by_server=_freeze(by_server),
+            servers=_freeze(states),
+            refresh=self._next_refresh(previous_state.refresh, llama.refresh_seconds,
+                                       attempted, failed=bool(errors)),
+            error=self.sanitize("; ".join(errors)) if errors else None,
+        ))
+        LOG.debug(
+            "llama.cpp discovery: %d server(s) reachable, %d model route(s)",
+            reachable,
+            len(public),
+        )
 
-    def llama_cpp_status(self) -> dict[str, Any]:
+    def llama_cpp_status(self, snapshot: RegistrySnapshot | None = None) -> dict[str, Any]:
+        snapshot = snapshot if snapshot is not None else self._registry
+        state = snapshot.llama
         llama = self.config.llama_cpp
+        now = self._clock()
+        interval = llama.refresh_seconds if llama else 0
+
+        def server_status(server: Mapping[str, Any]) -> dict[str, Any]:
+            freshness = self._refresh_status(
+                RefreshState(last_success=server["last_success"]), interval, server["error"], now,
+            )
+            return {**server, "url": self.sanitize(server["url"]),
+                    "age_seconds": freshness["age_seconds"],
+                    "stale_age_seconds": freshness["stale_age_seconds"]}
+
         return {
             "enabled": llama is not None,
-            "servers": [
-                {**state, "url": self.sanitize(state["url"])}
-                for state in self._llama_servers_state
-            ],
-            "models": len(self._llama_public),
-            "loaded": self._llama_updated != 0.0,
-            "error": self._llama_error,
+            "servers": [server_status(server) for server in state.servers],
+            "models": len(state.public),
+            "loaded": bool(state.by_server) or state.refresh.last_success is not None,
+            "error": state.error,
+            "refresh": self._refresh_status(state.refresh, interval, state.error, now),
         }
 
-    def _route_entry(self, route: Route, now: int) -> dict[str, Any]:
-        provider = self.provider(route.provider_name)
+    def _route_entry(self, route: Route, now: int, snapshot: RegistrySnapshot) -> dict[str, Any]:
+        provider = route._provider
+        assert provider is not None, "public routes must be bound to their provider"
+        if route.provider_name in snapshot.llama.providers:
+            server = next((s for s in snapshot.llama.servers if s["provider"] == route.provider_name), {})
+            interval = self.config.llama_cpp.refresh_seconds if self.config.llama_cpp else 0
+            freshness = self._refresh_status(
+                RefreshState(last_success=server.get("last_success")), interval,
+                server.get("error"), self._clock(),
+            )
+        elif route.name in snapshot.catalog.routes and route.name not in self.config.routes:
+            interval = self.config.catalog.refresh_seconds if self.config.catalog else 0
+            freshness = self._refresh_status(snapshot.catalog.refresh, interval,
+                                             snapshot.catalog.error, self._clock())
+        else:
+            freshness = {"stale": None, "age_seconds": None}
+        # Upstream metadata.router is never the router's own capability
+        # contract. Only reviewed reports and trusted sparse overrides feed it.
+        contract = router_metadata.render(
+            _thaw(route._capabilities) if route._capabilities else router_metadata.empty(route.dialect),
+            _thaw(self.config.capability_overrides.get(route.name, {})), freshness, now,
+        )
         entry: dict[str, Any] = {
             "id": route.name,
             "object": "model",
@@ -1908,36 +2410,27 @@ class App:
             "created": now,
             "created_at": now,
             "owned_by": route.provider_name,
-            "display_name": route.metadata.get("display_name", route.name),
+            "display_name": _thaw(route.metadata.get("display_name", route.name)),
             "metadata": {
-                **route.metadata,
+                **_thaw(route.metadata),
                 "provider": route.provider_name,
                 "upstream_model": route.upstream_model,
                 "dialect": route.dialect,
                 "provider_dialect": provider.dialect,
+                "router": contract,
             },
         }
         for key in ("context_window", "max_tokens"):
             if key in route.metadata:
-                entry[key] = route.metadata[key]
+                entry[key] = _thaw(route.metadata[key])
         return entry
 
     def models_payload(self) -> dict[str, Any]:
-        self._refresh_llama_cpp_if_stale()
-        self._refresh_catalog_if_stale()
+        return self._models_payload(self._registry)
+
+    def _models_payload(self, snapshot: RegistrySnapshot) -> dict[str, Any]:
         now = int(time.time())
-        routes = [route for route in self.config.public_routes if route.enabled]
-        names = {route.name for route in routes}
-        for route in self._llama_public:
-            if route.enabled and route.name not in names:
-                routes.append(route)
-                names.add(route.name)
-        routes.extend(
-            route
-            for route in self._catalog_routes.values()
-            if route.enabled and route.name not in names
-        )
-        data = [self._route_entry(route, now) for route in routes]
+        data = [self._route_entry(route, now, snapshot) for route in snapshot.public]
         return {
             "object": "list",
             "data": data,
@@ -1946,33 +2439,44 @@ class App:
             "last_id": data[-1]["id"] if data else None,
         }
 
+    def health_payload(self) -> dict[str, Any]:
+        # Liveness and inventory/status reads never perform or schedule I/O.
+        snapshot = self._registry
+        return {
+            "status": "ok",
+            "providers": len(snapshot.providers),
+            "models": len(snapshot.public),
+            "catalog": self.catalog_status(snapshot),
+            "llama_cpp": self.llama_cpp_status(snapshot),
+        }
+
     # -- routing ----------------------------------------------------------
 
     def resolve(self, model: str) -> Route | None:
-        route = self.config.routes.get(model)
+        snapshot = self._registry
+        route = snapshot.routes.get(model)
         if route is not None:
             return route if route.enabled else None
-        self._refresh_llama_cpp_if_stale()
-        route = self._llama_routes.get(model)
-        if route is not None:
-            return route if route.enabled else None
-        self._refresh_catalog_if_stale()
-        route = self._catalog_routes.get(model)
-        if route is not None:
-            return route if route.enabled else None
+        if model in snapshot.catalog.unmapped:
+            raise RouterError(
+                404,
+                f"Model {model!r} is listed by the catalog but its endpoint compatibility "
+                "is unknown. Configure catalog.model_providers or an explicit "
+                "[[models]] route after reviewing the provider endpoint.",
+                code="model_endpoint_unknown",
+            )
         # Dynamic "provider/model" routing is a convenience for people who do
         # not want to list every model explicitly.
         if "/" in model:
             provider_name, _, upstream = model.partition("/")
-            provider = self.config.providers.get(provider_name)
-            if provider is None:
-                provider = self._llama_providers.get(provider_name)
+            provider = snapshot.providers.get(provider_name)
             if provider is not None and upstream.strip():
                 return Route(
                     name=model,
                     provider_name=provider_name,
                     upstream_model=upstream.strip(),
                     dialect=provider.dialect,
+                    _provider=provider,
                 )
         return None
 
@@ -1983,17 +2487,37 @@ class App:
         payload: dict[str, Any],
         inbound_headers: Mapping[str, str],
     ) -> Plan:
-        provider = self.provider(route.provider_name)
+        provider = route._provider or self.provider(route.provider_name)
         session_id = _session_id(provider, payload, inbound_headers)
         if ingress == route.dialect:
             return self._passthrough(
                 ingress, provider, route, payload, inbound_headers, session_id
             )
-        if ingress == DIALECT_OPENAI_CHAT:
-            return self._from_openai_chat(provider, route, payload, session_id)
-        if ingress == DIALECT_OPENAI_RESPONSES:
-            return self._from_openai_responses(provider, route, payload, session_id)
-        return self._from_anthropic(provider, route, payload, session_id)
+        contract = self._route_entry(route if route._provider else replace(route, _provider=provider),
+                                     int(time.time()), self._registry)["metadata"]["router"]
+        params, losses = _prepare_translation(provider, route, ingress, payload, contract)
+        provider = _translation_header_provider(provider, inbound_headers)
+        if provider.dialect == DIALECT_ANTHROPIC:
+            # Its adapter rebuilds version/beta headers after kwargs merging.
+            # Reapply the selected opt-ins at the actual HTTP boundary using
+            # our server-owned shared client, without touching global state.
+            kwargs = _thaw(provider.litellm_kwargs)
+            kwargs["client"] = _AnthropicHeaderTransport(self.http, provider)
+            provider = replace(provider, litellm_kwargs=kwargs)
+        try:
+            if ingress == DIALECT_OPENAI_CHAT:
+                plan = self._from_openai_chat(provider, route, params, session_id)
+            elif ingress == DIALECT_OPENAI_RESPONSES:
+                plan = self._from_openai_responses(provider, route, params, session_id)
+            else:
+                plan = self._from_anthropic(provider, route, params, session_id)
+        except litellm.UnsupportedParamsError as exc:
+            raise RouterError(400, "The target adapter cannot translate these generation controls. "
+                              "Use a native route or review the provider compatibility policy.",
+                              code="translation_loss") from exc
+        if losses:
+            plan.headers["x-model-router-loss"] = json.dumps(losses, separators=(",", ":"))
+        return plan
 
     # -- pass-through -----------------------------------------------------
 
@@ -2270,9 +2794,18 @@ class App:
         return Plan(body=_json_bytes(_sanitize_generated_errors(_jsonable(result), self.sanitize)))
 
     def close(self) -> None:
-        self.http.close()
-        for logger in self._diagnostic_loggers:
-            logger.removeFilter(self._log_filter)
+        """Join discovery (including manual refreshes), then release transports."""
+        with self._close_lock:
+            if self._closed.is_set():
+                return
+            self._closed.set()
+            self.stop()
+            with self._catalog_lock, self._llama_lock:
+                try:
+                    self.http.close()
+                finally:
+                    for logger in self._diagnostic_loggers:
+                        logger.removeFilter(self._log_filter)
 
 
 # ---------------------------------------------------------------------------
@@ -2310,6 +2843,48 @@ def _set_header(headers: dict[str, str], name: str, value: str) -> None:
     headers[name] = value
 
 
+_TRANSLATION_HEADERS = {
+    DIALECT_ANTHROPIC: {"anthropic-beta", "anthropic-version"},
+    DIALECT_OPENAI_CHAT: {"openai-beta"},
+    DIALECT_OPENAI_RESPONSES: {"openai-beta"},
+    DIALECT_GEMINI: set(),
+}
+
+
+class _AnthropicHeaderTransport(HTTPHandler):
+    """Request-scoped header selection; App owns the shared HTTP connection pool."""
+
+    def __init__(self, client: httpx.Client, provider: Provider) -> None:
+        super().__init__(client=client)
+        self.selected = {key.lower(): val for key, val in provider.headers.items()
+                         if key.lower() in _TRANSLATION_HEADERS[DIALECT_ANTHROPIC]}
+        self.selected.update(provider.auth_headers())
+
+    def post(self, url: str, **kwargs: Any) -> httpx.Response:
+        headers = dict(kwargs.pop("headers", {}) or {})
+        for key, val in self.selected.items():
+            _set_header(headers, key, val)
+        return super().post(url, headers=headers, **kwargs)
+
+
+def _translation_header_provider(provider: Provider, inbound: Mapping[str, str]) -> Provider:
+    """Only destination-dialect opt-ins are client-controlled on a bridge.
+
+    Defaults < inbound < trusted kwargs.headers < kwargs.extra_headers <
+    provider.headers < auth. No credential/transport header comes from inbound.
+    """
+    headers = ({"anthropic-version": DEFAULT_ANTHROPIC_VERSION}
+               if provider.dialect == DIALECT_ANTHROPIC else {})
+    for source in (inbound, provider.litellm_kwargs.get("headers", {}),
+                   provider.litellm_kwargs.get("extra_headers", {}), provider.headers):
+        for name, value in source.items():
+            if source is not inbound or name.lower() in _TRANSLATION_HEADERS[provider.dialect]:
+                # LiteLLM merges native defaults with ordinary Python dicts;
+                # canonical names prevent differently cased defaults surviving.
+                _set_header(headers, name.lower(), value)
+    return replace(provider, headers=headers)
+
+
 def _serialized_json_headers(headers: Mapping[str, str]) -> dict[str, str]:
     """Let the transport frame JSON and discard metadata for original bytes."""
     result = {name: value for name, value in headers.items()
@@ -2332,7 +2907,8 @@ def _upstream_request_headers(
     }
     headers["accept-encoding"] = "identity"
     headers.setdefault("user-agent", f"litellm-model-router/{__version__}")
-    headers.update(provider.headers)
+    for name, value in provider.headers.items():
+        _set_header(headers, name, value)
 
     for name, value in provider.auth_headers().items():
         _set_header(headers, name, value)
@@ -2445,6 +3021,193 @@ def _clean_request_params(
     return params
 
 
+def _prepare_translation(
+    provider: Provider, route: Route, ingress: str, payload: Mapping[str, Any],
+    contract: Mapping[str, Any],
+) -> tuple[dict[str, Any], list[dict[str, str]]]:
+    """Conservative, body-only bridge contract; unknown model facts are neutral.
+
+    An adapter's supported-parameter list describes its mapping, not proof of
+    model support. Fields outside the reviewed bridge surface cannot silently
+    disappear, even when LiteLLM accepts them through **kwargs.
+    """
+    params = _thaw(_clean_request_params(payload, ingress))
+    losses: list[dict[str, str]] = []
+
+    def value(path: str) -> Any:
+        node: Any = contract
+        for key in path.split("."):
+            node = node.get(key, {})
+        return node.get("value")
+
+    def lose(path: str, reason: str, *, approximate: bool = False) -> None:
+        losses.append({"field": path, "reason": reason,
+                       "action": "approximated" if approximate else "dropped"})
+        if not approximate:
+            node = params
+            parts = path.split(".")
+            for key in parts[:-1]:
+                node = node.get(key, {})
+            node.pop(parts[-1], None)
+
+    # These bridge fields have an explicit mapping in the installed adapters.
+    # Native fields outside this set require their native endpoint.
+    if ingress == DIALECT_OPENAI_CHAT:
+        mapped = set(_GENERATION_FIELDS[ingress])
+        if route.dialect == DIALECT_OPENAI_RESPONSES:
+            mapped &= {"messages", "max_tokens", "max_completion_tokens", "stream",
+                       "stream_options", "tools", "tool_choice", "parallel_tool_calls",
+                       "response_format", "reasoning_effort", "verbosity", "temperature",
+                       "top_p", "user", "store", "service_tier", "safety_identifier",
+                       "prompt_cache_key", "prompt_cache_retention", "web_search_options"}
+    elif ingress == DIALECT_OPENAI_RESPONSES:
+        mapped = {"input", "instructions", "max_output_tokens", "stream", "tools",
+                  "tool_choice", "parallel_tool_calls", "reasoning", "text",
+                  "temperature", "top_p", "user", "service_tier", "safety_identifier"}
+    else:
+        mapped = {"messages", "system", "max_tokens", "stream", "temperature", "top_p",
+                  "top_k", "stop_sequences", "tools", "tool_choice", "thinking",
+                  "metadata", "output_format", "output_config"}
+        if route.dialect == DIALECT_OPENAI_RESPONSES:
+            mapped -= {"top_k", "stop_sequences"}
+    for key, item in list(params.items()):
+        if item is not None and key not in mapped | {"extra_body"}:
+            lose(key, "no reviewed bridge mapping")
+
+    # Tri-state facts: only explicit false/known enums reject a request. Unknown
+    # metadata never prevents an otherwise available adapter mapping.
+    for key in list(params):
+        if key in router_metadata.SAMPLING and value(f"sampling.{key}.supported") is False:
+            lose(key, "model capability is unsupported")
+    for key in list(params.get("extra_body", {})):
+        fact_key = "repeat_penalty" if key == "repetition_penalty" else key
+        if fact_key in router_metadata.SAMPLING and value(f"sampling.{fact_key}.supported") is False:
+            lose(f"extra_body.{key}", "model capability is unsupported")
+
+    for key in ("tools", "tool_choice", "functions", "function_call"):
+        if params.get(key) is not None and value("tools.supported") is False:
+            lose(key, "model capability is unsupported")
+    if params.get("parallel_tool_calls") is True and value("tools.parallel") is False:
+        lose("parallel_tool_calls", "model capability is unsupported")
+    if (params.get("tool_choice") is not None or params.get("parallel_tool_calls") is not None
+            ) and not params.get("tools"):
+        for key in ("tool_choice", "parallel_tool_calls"):
+            if params.get(key) is not None:
+                lose(key, "bridge requires tools for this control")
+    if params.get("tools") and route.dialect != DIALECT_OPENAI_RESPONSES:
+        function_tools = all(
+            tool.get("type", "function") == "function" for tool in params["tools"]
+        )
+        if not function_tools:
+            lose("tools", "native tool type requires a native route")
+            if "tool_choice" in params:
+                lose("tool_choice", "tool definitions cannot be translated")
+    if (ingress == DIALECT_ANTHROPIC and route.dialect == DIALECT_OPENAI_RESPONSES
+            and isinstance(params.get("tool_choice"), dict)
+            and "disable_parallel_tool_use" in params["tool_choice"]):
+        lose("tool_choice.disable_parallel_tool_use", "parallel tool constraint has no bridge mapping")
+
+    reasoning_key = "reasoning_effort" if ingress == DIALECT_OPENAI_CHAT else "reasoning"
+    reasoning = params.get(reasoning_key)
+    effort = reasoning.get("effort") if isinstance(reasoning, dict) else reasoning
+    if reasoning is not None:
+        if value("reasoning.supported") is False or value("reasoning.effort.supported") is False:
+            lose(reasoning_key, "model capability is unsupported")
+        elif effort is not None and value("reasoning.effort.values") is not None and effort not in value("reasoning.effort.values"):
+            lose(reasoning_key, "effort is outside the model's known values")
+        elif effort == "none" and route.dialect == DIALECT_ANTHROPIC:
+            lose(reasoning_key, "adapter omits this control instead of explicitly disabling thinking")
+        elif isinstance(reasoning, dict) and route.dialect != DIALECT_OPENAI_RESPONSES:
+            for key in list(reasoning):
+                if key != "effort":
+                    lose(f"{reasoning_key}.{key}", "reasoning detail has no reviewed bridge mapping")
+
+    thinking_path = "thinking" if "thinking" in params else "extra_body.thinking"
+    thinking = params.get("thinking", params.get("extra_body", {}).get("thinking"))
+    if thinking is not None:
+        if value("reasoning.supported") is False:
+            lose(thinking_path, "model capability is unsupported")
+        elif (thinking.get("budget_tokens") is not None
+              and value("reasoning.budget.supported") is False):
+            lose(thinking_path, "model budget control is unsupported")
+        elif (thinking.get("budget_tokens") is not None
+              and ((value("reasoning.budget.min_tokens") is not None
+                    and thinking["budget_tokens"] < value("reasoning.budget.min_tokens"))
+                   or (value("reasoning.budget.max_tokens") is not None
+                       and thinking["budget_tokens"] > value("reasoning.budget.max_tokens")))):
+            lose(thinking_path, "budget is outside the model's known bounds")
+        elif route.dialect != DIALECT_ANTHROPIC:
+            if value("reasoning.effort.supported") is False:
+                lose(thinking_path, "target effort control is unsupported")
+            elif ingress == DIALECT_ANTHROPIC and thinking.get("type") == "enabled":
+                # LiteLLM maps a token budget to an effort bucket. Keep that
+                # useful mapping only when the operator explicitly accepts loss.
+                lose(thinking_path, "token budget becomes an approximate effort", approximate=True)
+            else:
+                lose(thinking_path, "native thinking control requires a native route")
+        elif route.dialect == DIALECT_ANTHROPIC and thinking.get("type") == "adaptive":
+            lose(thinking_path, "adaptive thinking may become a token budget", approximate=True)
+
+    formats = [("response_format", params.get("response_format")),
+               ("text.format", (params.get("text") or {}).get("format")),
+               ("output_format", params.get("output_format")),
+               ("output_config.format", (params.get("output_config") or {}).get("format"))]
+    for path, fmt in formats:
+        if fmt is None:
+            continue
+        if not isinstance(fmt, dict):
+            raise _generation_error("output format")
+        if fmt.get("type") == "text":
+            continue
+        kind = fmt.get("type")
+        if (value("structured_output.supported") is False
+                or value(f"structured_output.{kind}") is False):
+            lose(path, "model capability is unsupported")
+        elif route.dialect == DIALECT_ANTHROPIC:
+            # LiteLLM can emulate JSON via a synthetic tool on some models;
+            # that is not equivalent to a native constrained output contract.
+            lose(path, "native structured output is not guaranteed by this bridge")
+        elif kind not in ("json_object", "json_schema"):
+            lose(path, "output format has no reviewed bridge mapping")
+    if params.get("text"):
+        for key in list(params["text"]):
+            if key != "format":
+                # Unknown nested keys must never become diagnostic/header data.
+                lose("text", "text controls beyond format have no reviewed bridge mapping")
+                break
+    if (params.get("output_config") or {}).get("effort") is not None:
+        lose("output_config.effort", "native effort control has no reviewed bridge mapping")
+
+    # A provider's Chat mapping table also applies after Responses/Messages
+    # normalization. Responses-native calls do not go through this table.
+    if route.dialect != DIALECT_OPENAI_RESPONSES:
+        supported = litellm.get_supported_openai_params(
+            model=route.upstream_model, custom_llm_provider=provider.litellm_provider)
+        aliases = {"max_output_tokens": "max_tokens", "stop_sequences": "stop",
+                   "reasoning": "reasoning_effort", "output_format": "response_format",
+                   "text": "response_format"}
+        special = {"messages", "input", "instructions", "system", "extra_body",
+                   "metadata", "output_config", "top_k"}
+        for key, item in list(params.items()):
+            if item is not None and key not in special and supported is not None:
+                mapped_key = aliases.get(key, key)
+                if key == "thinking" and ingress == DIALECT_ANTHROPIC:
+                    mapped_key = "reasoning_effort"
+                if mapped_key not in supported:
+                    lose(key, "target adapter has no mapping for this control")
+        if ("thinking" in params.get("extra_body", {}) and supported is not None
+                and "thinking" not in supported):
+            lose("extra_body.thinking", "target adapter has no mapping for this control")
+
+    if losses and not provider.drop_params:
+        fields = ", ".join(sorted({loss["field"] for loss in losses}))
+        raise RouterError(400, f"Translation would lose or approximate: {fields}. "
+                          "Use a same-protocol route, remove these controls, or ask the operator "
+                          "to configure compatibility = 'lossy' (with loss diagnostics).",
+                          code="translation_loss")
+    return params, losses
+
+
 def _translation_call_kwargs(
     provider: Provider, params: Mapping[str, Any], *, model: str,
     session_id: str | None,
@@ -2462,6 +3225,9 @@ def _translation_call_kwargs(
     if "thinking" in body:
         generation["thinking"] = body.pop("thinking")
     trusted = provider.litellm_call_kwargs(skip_mcp=True, session_id=session_id)
+    if trusted.get("additional_drop_params") or litellm.drop_params:
+        raise RouterError(500, "LiteLLM parameter dropping bypasses compatibility diagnostics; "
+                          "use the provider compatibility policy instead")
     body.update(trusted.pop("extra_body", {}) or {})
     result = {**generation, **trusted, "model": model}
     if body:
@@ -2535,6 +3301,7 @@ class RouterHTTPServer(ThreadingHTTPServer):
     request_queue_size = 16
 
     def __init__(self, address: tuple[str, int], handler: type[Handler]) -> None:
+        self.app = handler.app
         self.config = handler.app.config
         self._capacity_lock = threading.Lock()
         self._connections: set[socket.socket] = set()
@@ -2604,10 +3371,14 @@ class RouterHTTPServer(ThreadingHTTPServer):
     def shutdown(self) -> None:
         self._stop_connections()
         super().shutdown()
+        self.app.stop()
 
     def server_close(self) -> None:
         self._stop_connections()
-        super().server_close()
+        try:
+            super().server_close()
+        finally:
+            self.app.stop()
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -2669,15 +3440,7 @@ class Handler(BaseHTTPRequestHandler):
                     200,
                     "application/json",
                     {},
-                    _json_bytes(
-                        {
-                            "status": "ok",
-                            "providers": self.app.provider_count(),
-                            "models": len(self.app.models_payload()["data"]),
-                            "catalog": self.app.catalog_status(),
-                            "llama_cpp": self.app.llama_cpp_status(),
-                        }
-                    ),
+                    _json_bytes(self.app.health_payload()),
                 )
             if path in ("/v1/models", "/models"):
                 if not self.app.authorized(self.headers):
@@ -3081,7 +3844,13 @@ def _gunzip_limited(raw: bytes, limit: int) -> bytes:
 
 def serve(app: App, host: str, port: int) -> RouterHTTPServer:
     handler_class = type("BoundHandler", (Handler,), {"app": app})
-    return RouterHTTPServer((host, port), handler_class)
+    server = RouterHTTPServer((host, port), handler_class)
+    try:
+        app.start()
+    except BaseException:
+        server.server_close()
+        raise
+    return server
 
 
 def _find_default_config() -> Path | None:
@@ -3129,7 +3898,7 @@ def _print_summary(
             detail,
         )
         if not listening:
-            for name in sorted(app._catalog_routes):
+            for name in sorted(app._registry.catalog.routes):
                 LOG.info("  %s", name)
     if app is not None and config.llama_cpp is not None:
         status = app.llama_cpp_status()
@@ -3150,7 +3919,7 @@ def _print_summary(
                 ),
             )
         if not listening:
-            for route in sorted(app._llama_public, key=lambda item: item.name):
+            for route in sorted(app._registry.llama.public, key=lambda item: item.name):
                 LOG.info(
                     "  llama: %s (context %s)",
                     route.name,
@@ -3240,14 +4009,16 @@ def main(argv: list[str] | None = None) -> int:
 
     app = App(config)
     app.verbose = args.verbose
-    httpd = serve(app, config.host, config.port)
-    _print_summary(config, config.host, config.port, app=app)
+    httpd = None
     try:
+        httpd = serve(app, config.host, config.port)
+        _print_summary(config, config.host, config.port, app=app)
         httpd.serve_forever()
     except KeyboardInterrupt:
         LOG.info("Shutting down")
     finally:
-        httpd.server_close()
+        if httpd is not None:
+            httpd.server_close()
         app.close()
     return 0
 

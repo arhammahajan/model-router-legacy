@@ -375,6 +375,9 @@ def test_real_upstream_timeout_or_client_cancellation_recovers(cancel: bool) -> 
             app.config.providers["local"] = replace(
                 old_provider, base_url=f"http://127.0.0.1:{upstream.server_port}/v1",
                 timeout=1 if cancel else 0.2)
+            # Test setup changes become visible through registry publication;
+            # an existing snapshot deliberately retains its provider settings.
+            app._publish_registry()
             with connect(server) as held:
                 post(held)
                 assert entered.wait(2)
