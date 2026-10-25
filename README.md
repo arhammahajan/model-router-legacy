@@ -44,11 +44,18 @@ The repository ships a ready `router.toml` for an OpenCode Go subscription:
 
 Credentials are loaded **automatically** from `~/.config/ai/credentials.env` (or `$XDG_CONFIG_HOME/ai/credentials.env`) before the config is read. The file is expected to contain `OPENCODE_API_KEY=...`; nothing needs to be exported in your shell. Existing environment variables take precedence. Use `--env-file PATH` for another file or `--no-default-env` to disable this.
 
-The router fetches `https://opencode.ai/inference/go/v1/models` at startup, registers every model under its upstream ID, and refreshes the list every five minutes. Routing rules send:
+The router fetches the [public catalog](https://opencode.ai/inference/go/v1/models) at startup and every five minutes. The catalog supplies availability, but no endpoint compatibility information. `router.toml` contains an exact-ID mapping (revision 1, reviewed 2026-10-26) from the [official Go endpoint table](https://opencode.ai/v2/docs/console/go/#endpoints):
 
-- `claude-*` to OpenCode's Anthropic endpoint,
-- `gemini-*` to its Google/Gemini endpoint,
-- everything else to its OpenAI Responses endpoint.
+| Native upstream | Representative reviewed IDs |
+| --- | --- |
+| OpenAI Chat | `glm-5.3`, `kimi-k3`, `deepseek-v4.1-flash`, `mimo-v2.6-pro`, `minimax-m3.1-flash` |
+| OpenAI Responses | `gpt-6-luna`, `gpt-5.6-luna`, `grok-4.7`, `muse-spark-1.3-contributor` |
+| Anthropic Messages | `claude-haiku-5-5`, `minimax-m3`, `qwen3.8-max`, `qwen3.8-flash`, `qwen3.7-plus` |
+| Gemini | `gemini-4-argon` |
+
+These are exact IDs, not family-prefix rules: MiniMax M3.1 Flash uses Chat while M3 uses Messages. The checked-in snapshot contains 38 catalog IDs and 29 documented mappings. The other nine (`glm-5.1`, `grok-4.6`, `iceman-contributor-free`, `kimi-k2.6`, `minimax-m2.5`, `minimax-m2.7`, `omen-alpha`, `qwen3.6-plus`, `qwen3.7-max`) have unknown endpoint compatibility in this review. They and unmapped new IDs are omitted from `/v1/models`, reported in `/health` and `/healthz` under `catalog.unmapped_models` and in refresh warnings, and return HTTP 404 with an actionable message when requested (`model_endpoint_unknown` on OpenAI ingresses). An ID absent from the catalog and explicit/local routes returns HTTP 404 (`model_not_found` on OpenAI ingresses).
+
+Override an exact entry in `[catalog.model_providers]`, or add an explicit `[[models]]` route after reviewing the intended endpoint. A mapping references a trusted provider; URLs, credentials and auth headers stay in `[providers]`. Documented native routing does not establish compatibility with other endpoints. No authenticated cloud inference was performed; undocumented compatibility remains unknown.
 
 ```bash
 curl http://127.0.0.1:4000/v1/models
@@ -107,7 +114,7 @@ print(resp.choices[0].message.content)
 
 ```python
 resp = client.responses.create(
-    model="deepseek-v4.1-flash",        # routed to OpenCode's Responses endpoint
+    model="deepseek-v4.1-flash",        # translated to OpenCode's Chat endpoint
     input="Hello",
     max_output_tokens=256,
 )
@@ -223,7 +230,8 @@ Compatibility change (prompt 04): previously unbounded connections/generations n
 | `timeout` | Upstream timeout in seconds (default 600) |
 | `litellm_provider` | LiteLLM provider prefix (default `anthropic`, `gemini`, or `openai` by dialect) |
 | `litellm_kwargs` | Trusted administrative/generation keyword arguments passed to LiteLLM calls; never supplied by client JSON |
-| `drop_params` | Drop parameters the target does not support instead of erroring (default `true`) |
+| `compatibility` | Translation policy: `"strict"` (default) or explicit `"lossy"`; see below |
+| `drop_params` | Legacy alias: `false` selects strict, `true` selects diagnosed lossy mode; must agree with `compatibility` if both are set |
 
 Upstream credential selection has two behaviors:
 
@@ -233,6 +241,37 @@ Upstream credential selection has two behaviors:
 This avoids [LiteLLM's environment/global credential sources](https://docs.litellm.ai/docs/set_keys) without clearing or swapping process-wide environment variables during requests. Only named `api_key_env` settings opt into environment credentials. LiteLLM's `os.environ/NAME` key indirection is rejected; use `api_key_env` instead. Global LiteLLM `proxy_auth`, `client_session`, or `aclient_session`, which can inject auth after argument merging or through client defaults, cause translated calls to fail closed without modifying those globals. Keep custom credential-bearing clients/transports out of `litellm_kwargs`; they are trusted administrative code outside this native-adapter credential contract. Client-visible router auth is separate and never forwarded.
 
 Compatibility change (prompt 02): keyless passthrough calls now send the same placeholder as translation, replacing absent auth headers or the old `not-needed` placeholder. Existing nonempty configured keys continue to work. Raw HTTP error bodies are replaced as described above. These isolation regressions are tested against installed LiteLLM 1.106.4 with local upstreams and dummy environment/global keys for Anthropic, OpenAI Chat/Responses, and Gemini.
+
+### Translation compatibility and protocol headers
+
+Translated calls default to **strict** compatibility. Before dispatch, the router checks the reviewed bridge surface, LiteLLM's target Chat parameter mappings where applicable, and the route's effective `metadata.router` facts (including trusted capability overrides). Known unsupported reasoning, tools, structured output and sampling controls, known invalid effort values/budget bounds, unmapped native fields, and known approximations return HTTP **400** (`translation_loss` on OpenAI ingresses). The error identifies field paths and suggests removing the controls, selecting a native route, or changing the operator policy. Unknown capability facts and unknown effort enums do **not** mean unsupported: a control with an available mapping is still sent for the upstream to validate. An unknown model with no adapter mapping can still fail translation; that is a mapping limitation, not a claim that the model lacks the capability. Stale facts retain their reported values; use a capability override to correct or clear them.
+
+For a provider that explicitly accepts loss:
+
+```toml
+[providers.local]
+dialect = "openai-chat"
+base_url = "http://127.0.0.1:8080/v1"
+compatibility = "lossy"
+```
+
+Lossy mode removes identified unsupported/unmapped controls and reports each loss in the **`x-model-router-loss` response header**, a JSON array of `{field, reason, action}` objects. It is present on JSON and SSE responses when loss occurs, before stream events. No request values are included. For example, `[{"field":"reasoning","reason":"model capability is unsupported","action":"dropped"}]`. Clients that need fidelity should treat any diagnostic as a failed compatibility check. A native Anthropic token budget becomes an effort bucket on the Messages-to-OpenAI bridges: strict mode rejects that approximation; lossy mode keeps the mapping with `action: "approximated"`. Client JSON cannot select compatibility or LiteLLM administrative settings, even in lossy mode. Unknown request fields and unsafe extensions remain errors under the existing security boundary.
+
+Effort-to-effort Chat/Responses mappings, effort-to-Anthropic thinking budgets on recognized models, function tools, and Schema output between OpenAI dialects and from Messages have local upstream regression coverage. JSON output targeting Anthropic is conservatively rejected/dropped on bridges because an adapter's synthetic-tool emulation does not guarantee native constrained output. Native state, reasoning summaries, adaptive thinking, provider-hosted tools, stop controls targeting Responses, and other unmapped fields may require a native route. This is a bounded compatibility contract, not a promise to translate every native field without loss. Same-protocol bodies keep their existing vendor-field passthrough behavior and bypass translation capability checks.
+
+LiteLLM's own parameter dropping is disabled in both modes, following its [documented strict behavior](https://docs.litellm.ai/docs/completion/drop_params). Additional adapter refusals remain actionable errors even in lossy mode; the router does not retry a possibly accepted generation to recover from a parameter error. Global `litellm.drop_params=true` and nonempty trusted `additional_drop_params` fail closed on translated calls because they bypass diagnostics. Trusted generation overrides retain their existing precedence at call merging; compatibility preflight validates client controls, not arbitrary operator adapter customizations.
+
+Translated requests forward only these **destination-dialect** client opt-ins:
+
+| Destination | Allowed client headers |
+| --- | --- |
+| Anthropic Messages | `anthropic-beta`, `anthropic-version` |
+| OpenAI Chat / Responses | `openai-beta` |
+| Gemini | none (the API version is part of the configured URL) |
+
+Headers are matched/merged case-insensitively. Precedence is native version default < inbound allowlisted header < trusted `litellm_kwargs.headers` < trusted `litellm_kwargs.extra_headers` < provider `headers` < configured authentication. Values replace earlier values; beta lists are not concatenated. Anthropic defaults to `2023-06-01` when no version is supplied, preserving existing behavior; see its [version header](https://platform.claude.com/docs/en/api/versioning) and [beta opt-ins](https://platform.claude.com/docs/en/api/beta-headers). A beta header enables only the upstream feature; it does not give an unmapped request field a bridge mapping. Client credentials, cookies, destinations, transport/representation headers and arbitrary headers cannot enter translated calls. The configured session-header mechanism is unchanged. Same-protocol forwarding keeps its broader filtered header policy; configured headers now also replace inbound headers case-insensitively. Authentication and serialized JSON framing remain server-owned on both paths.
+
+**Compatibility change (prompt 10):** omitted `drop_params` used to enable silent dropping; the default is now strict. Explicit legacy `drop_params=true` selects lossy mode with diagnostics rather than enabling LiteLLM dropping. Review affected clients and configure loss acceptance deliberately.
 
 ### Models
 
@@ -246,35 +285,43 @@ If a request names an unlisted model as `provider/model`, the router forwards it
 
 ### Dynamic catalogs
 
-A catalog fetches model IDs from an OpenAI-style `/v1/models` endpoint and registers each one under its upstream ID:
+A catalog fetches model IDs from an OpenAI-style `/v1/models` endpoint and registers mapped IDs under their upstream names. For example, using the providers from `router.toml`:
 
 ```toml
 [catalog]
 url = "https://opencode.ai/inference/go/v1/models"
 refresh_seconds = 300          # 0 = startup only
-headers = { "User-Agent" = "litellm-model-router/0.2.0" }
+headers = { "User-Agent" = "litellm-model-router/0.3.0" }
 
-# Regex rules matched against each model ID; the first match wins.
-[[catalog.rules]]
-match = "^claude-"
-provider = "opencode-anthropic"
-
-[[catalog.rules]]
-match = "^gemini-"
-provider = "opencode-gemini"
-
-[[catalog.rules]]
-match = "."
-provider = "opencode-openai"
+# Exact entries win over optional regex rules. See router.toml for the full map.
+[catalog.model_providers]
+"deepseek-v4.1-flash" = "opencode-chat"
+"gpt-6-luna" = "opencode-openai"
+"claude-haiku-5-5" = "opencode-anthropic"
+"gemini-4-argon" = "opencode-gemini"
+"minimax-m3" = "opencode-anthropic"
+"minimax-m3.1-flash" = "opencode-chat"
+"qwen3.8-max" = "opencode-anthropic"
 ```
 
-Catalog failures are logged and retried without stopping the server; existing routes keep working.
+`catalog.model_providers` maps exact model IDs to configured provider names, which select the dialect and trusted endpoint. Entries do not create routes unless the ID is present in the fetched catalog. Explicit `[[models]]` routes and aliases retain precedence and can also expose models absent from the catalog. An explicit route for the same public ID can override a catalog mapping:
+
+```toml
+[[models]]
+name = "deepseek-v4.1-flash"
+provider = "opencode-chat"
+model = "deepseek-v4.1-flash"
+```
+
+Existing `[[catalog.rules]]` regex rules remain supported as an operator opt-in: exact mappings win, then the first matching rule. At least one exact mapping or rule is required. A broad prefix or catch-all rule explicitly accepts responsibility for routing future matching IDs; the bundled Go configuration has neither. Catalog data cannot choose a provider, URL or credential. Unmapped IDs without an explicit/local route are omitted, diagnosed and rejected as described above. Explicit `provider/model` requests remain a manual endpoint choice using the named provider's dialect; they do not establish verified compatibility.
+
+Catalog fetch/parse failures retain existing routes and are logged and retried in the background, subject to the refresh policy below. A successful empty or entirely unmapped catalog replaces the previous catalog routes with an empty inventory and still reports `loaded = true`.
 
 ### Local llama.cpp discovery
 
 The router can probe running [llama.cpp](https://github.com/ggml-org/llama.cpp) servers and expose every model they report. This ports the discovery behavior of [pi-llama-cpp](https://github.com/gsanhueza/pi-llama-cpp): single-model, router (`--models-preset`), legacy (`ik_llama.cpp`) and [llama-swap](https://github.com/mostlygeek/llama-swap) servers are recognized.
 
-A config needs explicit `[[models]]`, a `[catalog]`, a `[llama_cpp]`, or any combination. Explicit routes win when a name collides, then discovered llama.cpp models, then catalog models.
+A config needs explicit `[[models]]`, a `[catalog]`, a `[llama_cpp]`, or any combination. Explicit routes win when a name collides, then discovered llama.cpp models, then catalog models. Explicit aliases and disabled explicit names also reserve their names against discovery; an overridden catalog entry is not separately advertised in `/v1/models`.
 
 ```toml
 [llama_cpp]
@@ -282,7 +329,7 @@ servers = ["http://127.0.0.1:9931"]   # URLs or { url, name, api_key, headers }
 # ports = [9931, 8080]                 # convenience: localhost URLs
 refresh_seconds = 30                   # 0 = startup only
 timeout = 2                            # per-probe timeout
-context_fallback = 128000              # when the server reports no context size
+context_fallback = 128000              # labeled estimate when context is unavailable
 prefix = ""                            # e.g. "llama/" to namespace model IDs
 aliases = true                         # expose llama.cpp aliases as routes
 api_key_env = "LLAMA_API_KEY"          # for servers started with --api-key
@@ -298,24 +345,89 @@ curl http://127.0.0.1:4000/v1/chat/completions \
   -d '{"model":"Qwen3-8B-Q4_K_M","messages":[{"role":"user","content":"Hi"}]}'
 ```
 
+Server provider identities are reserved for **all configured servers before probing**, including unreachable servers. Explicit `name` values must be unique and must not match a static `[providers]` name; duplicate names now fail configuration validation with the conflicting entries and a suggested fix. Omit `name` for a generated identity: the router normalizes the URL into `llama-…`, reserves all static and explicit names first, then resolves collisions with `-2`, `-3`, etc. in server configuration order. Reachability and probe completion order never change identities. Changing server order or configuration can change generated suffixes; use unique explicit names when identities must survive configuration edits.
+
 Discovery reads:
 
 | Endpoint | Used for |
 | --- | --- |
 | `/health` | reachability (the server is skipped when this fails) |
-| `/v1/models` | model IDs, aliases, `meta.n_ctx`, `status`, `architecture` |
-| `/props?autoload=false` | server mode (`role: "router"` / `src: "llama-swap"`) |
+| `/v1/models` | model IDs, aliases, per-model limits, `status`, `architecture` |
+| `/props?autoload=false` | server mode and single/legacy runtime context and generation defaults |
+| `/props?model=<id>&autoload=false` | limits/defaults for each loaded or sleeping router model; optional on older servers |
 
-Context size follows pi-llama-cpp's rules:
+Each discovered model has `metadata.limits`, separating these token counts:
 
-- **Router mode** — `meta.n_ctx` when loaded; otherwise `--ctx-size` / `--fit-ctx` / `-c` from the model's launch arguments.
-- **Single and llama-swap** — `meta.n_ctx`.
-- **Legacy** — `max_model_len`, falling back to `n_ctx` from `/props`.
-- Otherwise `context_fallback` (default 128000).
+| Field | Meaning |
+| --- | --- |
+| `context_window` | Effective runtime context when reported; otherwise a labeled launch estimate or fallback |
+| `trained_context_window` | Model's trained context, independent of runtime capacity |
+| `max_input_tokens` | Explicit input maximum, otherwise unknown |
+| `max_output_tokens` | Explicit maximum generation length, otherwise unknown |
+| `default_output_tokens` | Default generation length, independent of any maximum |
 
-Each model appears in `/v1/models` with its display name (first alias), `context_window`, `max_tokens`, `capabilities` (`text`, `image`), and a `metadata.llama_cpp` object containing the server URL, detected mode and load status. Aliases resolve to the same upstream route unless `aliases = false`.
+Each field is an object with `value` (integer or `null`), `source` (field/config path or `null`) and `kind` (`reported`, `override`, `inferred`, `fallback`, or `unknown`). For example, a single server reporting only `/props.default_generation_settings.n_ctx = 4096` yields `context_window = {"value": 4096, "source": "/props.default_generation_settings.n_ctx", "kind": "reported"}` and an unknown output maximum. Flat numeric copies also appear in `metadata`.
 
-If a server becomes unreachable during a refresh, its last known routes are kept and the failure is reported in `/health` (`llama_cpp.servers[].reachable = false`, `stale = true`). A server that was never reachable is simply absent. The router itself keeps serving.
+Precedence is explicit `llama_cpp.limit_overrides` first, then usable per-model reports, then launch-argument estimates, then the configured context fallback (default 128000). Within reports, runtime context prefers `/v1/models.meta.n_ctx`, then `/props.default_generation_settings.n_ctx`, then `/props.n_ctx`. Legacy mode prefers `max_model_len` before those sources. Global `/props` values apply only in single/legacy mode: router mode queries loaded/sleeping models individually, always with `autoload=false`; unloaded models are never loaded to collect metadata. Unsupported/failed per-model queries leave listing metadata and estimates available. llama-swap retains per-model `meta.n_ctx` and nested aliases, without applying its global properties to every model.
+
+Trained context uses `meta.n_ctx_train`, router-mode `context_length`, then model-specific `/props.n_ctx_train`. Input/output maxima use only explicit `max_input_tokens` / `max_output_tokens` fields, preferring model `meta`, the model row, model `metadata`, then applicable `/props`. Input capacity is not calculated from context or by subtracting a generation budget. Generation defaults prefer `/props.default_generation_settings.params.n_predict`, then the older direct `n_predict`, then nested/direct default `max_tokens`, then launch `--predict` / `--n-predict` / `-n`. A default is never a hard maximum. Special defaults `-1` and `-2` have `value: null` with `special: "unlimited"` or `"until_context"`; zero is a valid no-generation default.
+
+Launch `--ctx-size` / `-c` and generation flags accept split (`-c 8192`) and equals (`--ctx-size=8192`) forms; the last occurrence wins, including zero/auto/invalid values that clear an earlier estimate. Context estimates describe the requested size, which can differ from usable per-request capacity because of slots, fitting, or server-version behavior; use `kind: reported` for runtime-aware decisions. `--fit-ctx` / `-fitc` is recorded separately under `metadata.limits.constraints.fit_context_min` with `kind: constraint` and never establishes runtime context. Context zero/negative/auto, booleans, fractional/nonfinite numbers and malformed data cannot establish a positive limit. Model names are never used to infer limits.
+
+Overrides enrich discovered limits without duplicating routing configuration. Keys match the exact upstream model ID **before** `prefix` or aliases and apply to that ID on all configured local servers:
+
+```toml
+[llama_cpp.limit_overrides."my-model-id"]
+context_window = 8192
+trained_context_window = 131072
+max_input_tokens = 8000
+max_output_tokens = 2048
+default_output_tokens = 256
+```
+
+Omit fields to retain discovery. Values must be positive integers, except `default_output_tokens` also accepts zero; `context_fallback` itself must also be a positive integer. JSON configs can explicitly set a field to `null` to report it as unknown. Overrides and fallback sizes only change advertised metadata; they do not reconfigure or enforce limits on the upstream server.
+
+**Compatibility change (prompt 08):** top-level `context_window` and `metadata.llama_cpp.n_ctx` remain aliases of the resolved context, including labeled estimates. Top-level/metadata `max_tokens` now mean **maximum output tokens** and are `null` unless explicitly known or overridden; they no longer equal context size automatically. Explicit static-route metadata keeps its existing user-defined meaning. Clients should read `metadata.limits` and its provenance before selecting budgets. Listings still include display name (first alias), capabilities (`text`, `image`), server URL, detected mode and load status; aliases share the same upstream route unless `aliases = false`.
+
+Upstream semantics were checked against the [llama.cpp server documentation](https://github.com/ggml-org/llama.cpp/blob/master/tools/server/README.md) and [model/property response implementation](https://github.com/ggml-org/llama.cpp/blob/master/tools/server/server-context.cpp). Older versions may report less information; missing data remains unknown or explicitly estimated.
+
+If a server becomes unreachable during a refresh, its last known routes are kept and the failure is reported in `/health` (`llama_cpp.servers[].reachable = false`, `stale = true`). A server that was never reachable has no routes or active provider, but its reserved identity is reported as `llama_cpp.servers[].provider`. A successful empty model list removes that server's previous model routes. Failed catalog refreshes likewise retain the last successful catalog routes. The router itself keeps serving.
+
+Providers, routes, public model entries and discovery status are published as one immutable registry snapshot. Each model listing and health response uses one snapshot, and a resolved request retains its route and provider through dispatch even if refresh removes the entry or changes provider settings. Later requests use the new snapshot.
+
+### Versioned model capabilities
+
+Model listings now include `metadata.router.schema_version = 1` while preserving the existing list envelope and legacy fields. The extension describes reasoning toggles, exact known effort values, budgets, defaults and native mappings; separate input/output modalities; tools and parallel calls; structured output; sampling controls; native/translated protocols; and field provenance, conflicts and freshness. Boolean false means unsupported; null means unknown. llama.cpp's effort-support flag does not establish any effort values.
+
+Local enrichment uses applicable `/props` defaults, modality flags, template capabilities and build information, with per-model router queries using `autoload=false` only for loaded/sleeping models. The bundled Go configuration enables `catalog.metadata_source = "opencode-go-v1"`, joining availability with a frozen, provider-specific Models.dev review. Its review freshness expires after 30 days independently of live catalog refreshes; there are no runtime Models.dev requests. Reviewed facts are not authenticated inference verification. Exact model/dialect matches are required, and missing controls or enums remain unknown.
+
+Sparse `[capabilities.overrides."public-model-id"]` tables enrich existing or subsequently discovered routes without copying routing configuration. They cannot create routes, select transports, or configure SDKs/UIs. Clients must consume the extension explicitly and map controls for their selected ingress. See [CAPABILITIES.md](CAPABILITIES.md) for the complete schema, evidence/precedence rules, override examples, source review procedure, and client integration example. Prompt 08's corrected limits are reused under `metadata.router.limits`; their existing fields and overrides retain their semantics.
+
+### Discovery refresh and lifecycle
+
+The router makes **one synchronous discovery attempt per configured source before listening**, preserving initial inventory and `--check` behavior. After startup, a managed background worker refreshes catalog and llama.cpp discovery on independent schedules. Model listing, resolution, and `/health` / `/healthz` only read cached state: they never initiate or wait for discovery network work. Liveness continues to return `status = "ok"` during discovery outages; it does not certify upstream readiness.
+
+After a successful round, the next attempt is due `refresh_seconds` after completion. After a failed round, retries use exponential backoff: the ceiling starts at 5 seconds, doubles with each consecutive failure, and caps at 300 seconds. Each delay is chosen uniformly between half the ceiling and the ceiling. Retries are measured from completion, independently of the last success. Recovery resets the failure count and restores the configured refresh interval. Overlapping refresh calls for the same source return immediately, including explicit forced calls. Request bursts cannot trigger extra attempts.
+
+For llama.cpp, servers are probed concurrently (up to eight); successful servers publish their new inventories while failed servers retain their own last usable routes. Any server failure counts as a failed discovery round for scheduling, even if others succeed. The source's `last_success` records the last **entirely successful round**; each server also reports its own success and attempt times. Optional `/props` remains best effort. The single scheduling worker processes llama.cpp and catalog in turn, so an active source can delay the other until its probes finish under the configured HTTP timeouts.
+
+Set a source's `refresh_seconds = 0` for **startup-only** mode. This now means exactly one startup attempt, even when that attempt fails; there are no automatic retries for that source. Set a positive interval to discover servers started later or recover automatically from startup failure. If discovery has never succeeded, its inventory is empty: explicit routes and other successful sources remain available, unknown models return 404, and an unreachable llama.cpp server has no active provider for `provider/model` routing. A partially successful first llama.cpp round exposes the successful servers and reports `loaded = true` even though the round's `last_success` is still null.
+
+The existing health responses include `catalog.refresh` and `llama_cpp.refresh`, atomically associated with their inventories:
+
+| Field | Meaning |
+| --- | --- |
+| `last_success`, `last_attempt`, `next_attempt` | Process-local monotonic timestamps; null means no success, no attempt, or no scheduled retry respectively. They are not Unix timestamps and cannot be compared across restarts. |
+| `consecutive_failures` | Failed rounds since the last complete success. |
+| `age_seconds` | Time since last success; null if never successful. |
+| `stale` | No successful round, a failed round, or the normal refresh interval has elapsed. A successful startup-only inventory does not expire. |
+| `stale_age_seconds` | Time beyond the normal refresh interval since last success, floored at zero; null if never successful. Startup-only inventories report zero. |
+
+Errors remain sanitized and length-limited. Per-server llama.cpp status includes `last_success`, `last_attempt`, `age_seconds`, and `stale_age_seconds`; its existing `stale` flag identifies retained routes after a failed probe. Freshness ages are derived at read time from the captured immutable snapshot, so they keep increasing during a blocked refresh. New timestamps, retry state, errors and inventories publish together after the attempt completes; readers keep the previous complete generation while it is in progress.
+
+For embedders, `App(config)` performs the initial attempt; `app.start()` starts scheduling and is idempotent. `serve()` starts it after binding, and the HTTP server's `shutdown()` / `server_close()` stop it. `app.stop()` joins the worker and permits a later `start()`; `app.close()` is idempotent, permanently stops scheduling, waits for active discovery, closes HTTP resources, and removes diagnostic filters. Always call `close()` in a `finally` block. Shutdown waits for in-flight probes to finish under the configured timeouts, then skips remaining sources; it does not abandon probe threads. `--check` starts no background worker. Refresh intervals and discovery timeouts must be finite and within `threading.TIMEOUT_MAX` (timeouts positive; intervals nonnegative).
+
+**Compatibility:** requests no longer discover a new model synchronously; it becomes available after the next scheduled round. Failed startup-only discovery no longer retries automatically. Last usable routes are retained in memory without an expiry, so generation can still fail against an unavailable upstream. No discovery state is persisted across restarts.
 
 ### Router auth
 
@@ -323,7 +435,7 @@ Set `server.api_keys` (or `MODEL_ROUTER_API_KEY` / comma-separated `MODEL_ROUTER
 
 ## Behavior notes and limits
 
-- **Translation** is LiteLLM's, not a hand-rolled field mapper. Parameters unsupported by the target are dropped when `drop_params` is true (the default) and rejected otherwise. Token *counts* and error wording differ slightly between dialects; the response shape is always the ingress dialect's.
+- **Translation** uses LiteLLM adapters with the strict/lossy policy below. Native features do not all have equivalent mappings. Token *counts* and error wording differ between dialects; the response shape follows the ingress dialect.
 - **Anthropic ingress requires `max_tokens`**, as the Anthropic API does.
 - **Reasoning / encrypted content** survives only on a same-dialect pass-through. Crossing protocols necessarily re-encodes it (or drops it, if the target has no equivalent).
 - **`sequence_number`** is added to translated Responses streams so OpenAI clients see a monotonic counter.
@@ -341,7 +453,9 @@ Set `server.api_keys` (or `MODEL_ROUTER_API_KEY` / comma-separated `MODEL_ROUTER
 .venv/bin/python -m pytest
 ```
 
-The suite starts a fake upstream, a fake llama.cpp server and the real router in-process. It exercises every ingress→upstream combination (streaming and non-streaming), pass-through fidelity, tool-schema translation, auth, session-header forwarding, catalog discovery, llama.cpp discovery across single/router/legacy modes (context sizes, aliases, prefixes, stale routes), gzip/chunked bodies, dynamic routing, and model listing. The fake upstream honors request content encoding. Raw-socket and bounded-reader tests cover malformed framing, truncated bodies, chunk metadata limits, gzip integrity/completion, and encoded/decompressed size limits. Capacity tests use local sockets, controlled upstreams, and held generations to cover admission before thread creation, absolute read deadlines, stalled response readers, sync/async stream disconnects, overload recovery, and shutdown.
+The suite starts a fake upstream, a fake llama.cpp server and the real router in-process. It exercises every ingress→upstream combination (streaming and non-streaming), pass-through fidelity, tool-schema translation, auth, session-header forwarding, catalog discovery, llama.cpp discovery across single/router/legacy modes (context sizes, aliases, prefixes, stale routes), gzip/chunked bodies, dynamic routing, and model listing. Bundled Go routing tests use checked-in public catalog/endpoint fixtures, fake credentials and a blocked network transport; tests never fetch the live catalog or perform cloud inference. See `tests/fixtures/README.md` for the mapping review procedure. The fake upstream honors request content encoding. Registry tests cover duplicate explicit names, generated-name collisions through recovery/failure, route precedence and stale inventories. Events and barriers pause requests between resolution and dispatch, pause model/health reads across refresh, and coordinate concurrent catalog/local publications without sleep-based races. Raw-socket and bounded-reader tests cover malformed framing, truncated bodies, chunk metadata limits, gzip integrity/completion, and encoded/decompressed size limits. Capacity tests use local sockets, controlled upstreams, and held generations to cover admission before thread creation, absolute read deadlines, stalled response readers, sync/async stream disconnects, overload recovery, and shutdown.
+
+`tests/test_discovery_refresh.py` uses a fake monotonic clock and controlled local HTTP responses to cover success/failure/recovery, bounded jitter and backoff, partial outages, startup-only failures, independent source schedules, cached liveness/listing/resolution during request bursts, overlapping refresh calls, and worker/transport cleanup. Events hold responses open and observe worker idle boundaries without sleep-based races.
 
 ## CLI
 
@@ -351,4 +465,4 @@ python model_router.py [-c CONFIG] [--host HOST] [--port PORT]
                        [--check] [--verbose] [--version]
 ```
 
-`--check` validates the config, refreshes the catalog, and prints the routes without listening.
+`--check` validates the config, makes one initial attempt for each configured discovery source, and prints the routes without listening or starting a background worker.
