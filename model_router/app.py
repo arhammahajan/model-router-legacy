@@ -13,6 +13,7 @@ import httpx
 from .adapters import adapter
 from .common import (
     RouterError,
+    _apply_llama_thinking,
     _error_payload,
     _json_bytes,
     _jsonable,
@@ -216,6 +217,8 @@ class App(DiscoveryRegistry):
         url = _upstream_url(provider, ingress)
         body = dict(payload)
         body["model"] = route.upstream_model
+        if provider.llama_cpp and ingress == DIALECT_OPENAI_CHAT:
+            _apply_llama_thinking(body, body.pop("reasoning_effort", None))
 
         request = client.build_request(
             "POST",

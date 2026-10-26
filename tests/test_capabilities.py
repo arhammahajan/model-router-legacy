@@ -109,7 +109,7 @@ def test_props_capabilities_and_corrected_limits(monkeypatch: pytest.MonkeyPatch
         assert found["tools"]["parallel"]["value"] is False
         assert found["reasoning"]["supported"]["value"] is True
         assert found["reasoning"]["effort"]["supported"]["value"] is True
-        assert found["reasoning"]["effort"]["values"]["value"] is None
+        assert found["reasoning"]["effort"]["values"]["value"] == list(caps.LLAMA_EFFORT_VALUES)
         assert found["reasoning"]["toggle"]["supported"]["value"] is None
         assert found["reasoning"]["budget"]["supported"]["value"] is None
         assert found["reasoning"]["effort"]["native_parameter"]["value"] == {
@@ -151,7 +151,12 @@ def test_router_queries_only_loaded_or_sleeping_models(monkeypatch: pytest.Monke
     app = mr.App(mr.build_config(local_raw()))
     try:
         assert contract(app, "loaded")["modalities"]["input"]["image"]["value"] is False
-        assert contract(app, "loaded")["reasoning"]["effort"]["supported"]["value"] is False
+        # The upstream's chat-template report is kept as conflicting evidence;
+        # the router's own thinking mapping is what makes effort usable.
+        loaded_effort = contract(app, "loaded")["reasoning"]["effort"]["supported"]
+        assert loaded_effort["value"] is True and loaded_effort["kind"] == "configured"
+        assert loaded_effort["source"] == "router.llama_thinking_map.supported"
+        assert [c["value"] for c in loaded_effort["conflicts"]] == [False]
         assert contract(app, "loaded")["reasoning"]["supported"]["value"] is None
         assert contract(app, "sleeping")["modalities"]["input"]["audio"]["value"] is True
         assert contract(app, "sleeping")["sources"]["llama.props"]["endpoint"].startswith("/props?model=")
@@ -189,7 +194,9 @@ def test_unknown_and_legacy_metadata_preserve_unknowns(monkeypatch: pytest.Monke
     try:
         found = contract(app, "thinking-128k-high-max")
         assert found["reasoning"]["supported"]["value"] is None
-        assert found["reasoning"]["effort"]["values"]["value"] is None
+        # Effort is the router's own mapping; whether the model thinks stays unknown.
+        assert found["reasoning"]["effort"]["supported"]["value"] is True
+        assert found["reasoning"]["effort"]["values"]["value"] == list(caps.LLAMA_EFFORT_VALUES)
         assert found["modalities"]["input"]["image"]["value"] is True
         assert found["modalities"]["output"]["image"]["value"] is None
         assert found["limits"]["context_window"]["value"] == 4096

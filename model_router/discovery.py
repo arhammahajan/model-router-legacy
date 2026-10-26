@@ -486,6 +486,7 @@ class DiscoveryRegistry:
             base_url=_llama_base_url(server.url), api_key=server.api_key,
             headers={**llama.headers, **server.headers}, timeout=DEFAULT_TIMEOUT,
             litellm_provider="openai", litellm_kwargs={}, drop_params=False,
+            llama_cpp=True,
         )
 
     def _cached_route(self, row: Any, provider: Provider, prefix: str = "") -> Route:

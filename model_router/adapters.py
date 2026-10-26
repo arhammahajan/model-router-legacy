@@ -5,7 +5,7 @@ import os
 from importlib import metadata as importlib_metadata
 from typing import Any, Iterator, Mapping
 
-from .common import RouterError, _close_quietly
+from .common import RouterError, _apply_llama_thinking, _close_quietly
 from .config import Provider
 from .constants import _TRANSLATION_HEADERS, DIALECT_OPENAI_CHAT, TESTED_LITELLM_VERSION
 from .headers import _set_header
@@ -122,6 +122,21 @@ def _translation_call_kwargs(
     # Never promote arbitrary extra_body members into keyword arguments.
     if "thinking" in body:
         generation["thinking"] = body.pop("thinking")
+    if provider.llama_cpp:
+        # Same effort mapping as the Chat pass-through, for translated ingresses.
+        effort = generation.pop("reasoning_effort", None)
+        reasoning = generation.get("reasoning")
+        if isinstance(reasoning, dict) and "effort" in reasoning:
+            effort = reasoning["effort"]
+            rest = {k: v for k, v in reasoning.items() if k != "effort"}
+            if rest:
+                generation["reasoning"] = rest
+            else:
+                del generation["reasoning"]
+        native: dict[str, Any] = {}
+        _apply_llama_thinking(native, effort)
+        for key, value in native.items():
+            body.setdefault(key, value)
     trusted = provider.litellm_call_kwargs(skip_mcp=True, session_id=session_id)
     if trusted.get("additional_drop_params") or litellm.drop_params:
         raise RouterError(500, "LiteLLM parameter dropping bypasses compatibility diagnostics; "

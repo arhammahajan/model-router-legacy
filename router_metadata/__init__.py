@@ -19,7 +19,10 @@ SAMPLING = (
     "xtc_probability", "xtc_threshold", "samplers",
     "top_n_sigma", "adaptive_target", "adaptive_decay", "dry_sequence_breakers",
 )
-LIMITS = ("context_window", "trained_context_window", "max_input_tokens",
+# Effort levels the router maps to llama.cpp thinking controls; see
+# model_router._apply_llama_thinking.
+LLAMA_EFFORT_VALUES = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
+LIMITS = ("context_window","trained_context_window", "max_input_tokens",
           "max_output_tokens", "default_output_tokens")
 
 
@@ -311,6 +314,16 @@ def llama(row: Mapping[str, Any], props: Any, mode: str, limits: Mapping[str, An
                    "chat_template_caps.supports_reasoning_effort", kind="inferred")
         # No effort enum, toggle, budget, or default follows from this boolean.
         # supports_preserve_reasoning concerns history, not a thinking toggle.
+
+    # Independent of the chat template: the router maps OpenAI reasoning effort
+    # onto llama.cpp's native thinking_budget_tokens/enable_thinking fields. This
+    # states the control exists, not that a given model produces thinking.
+    source_name = "router.llama_thinking_map"
+    report("reasoning.effort.supported", True, "supported", source_name, "configured")
+    report("reasoning.effort.values", list(LLAMA_EFFORT_VALUES), "values", source_name, "configured")
+    report("reasoning.effort.native_parameter", {"protocol": "openai-chat", "path": "reasoning_effort"},
+           "native_parameter", source_name, "configured")
+    result["sources"][source_name] = {"verification": "router request mapping, not an upstream report"}
 
     defaults = props.get("default_generation_settings")
     if isinstance(defaults, Mapping):

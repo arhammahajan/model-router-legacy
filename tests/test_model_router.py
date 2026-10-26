@@ -2165,6 +2165,70 @@ def test_llama_cpp_discovers_models_aliases_and_context(
         assert _text_from_response("anthropic", response.json()) == "llama pong"
 
 
+@pytest.mark.parametrize("effort, expected", [
+    ("none", {"chat_template_kwargs": {"enable_thinking": False}}),
+    ("minimal", {"thinking_budget_tokens": 1024}),
+    ("low", {"thinking_budget_tokens": 2048}),
+    ("medium", {"thinking_budget_tokens": 8192}),
+    ("high", {"thinking_budget_tokens": 16384}),
+    ("xhigh", {"thinking_budget_tokens": 32768}),
+    ("max", {}),  # unbounded: leave the server default
+])
+def test_llama_cpp_maps_reasoning_effort_to_native_thinking_fields(
+    llama_server: FakeLlamaServer, effort: str, expected: dict[str, Any],
+) -> None:
+    with router_config(_llama_only_config(llama_server)) as base_url:
+        response = httpx.post(
+            base_url + "/v1/chat/completions",
+            json={**_body("openai-chat", "llama-test", False), "reasoning_effort": effort},
+        )
+        assert response.status_code == 200
+        sent = llama_server.last_request("/v1/chat/completions")["body"]
+        assert "reasoning_effort" not in sent
+        for key in ("thinking_budget_tokens", "chat_template_kwargs"):
+            if key in expected:
+                assert sent[key] == expected[key]
+            else:
+                assert key not in sent
+
+
+def test_llama_cpp_explicit_native_thinking_fields_win(llama_server: FakeLlamaServer) -> None:
+    with router_config(_llama_only_config(llama_server)) as base_url:
+        httpx.post(base_url + "/v1/chat/completions", json={
+            **_body("openai-chat", "llama-test", False), "reasoning_effort": "high",
+            "thinking_budget_tokens": 7,
+        })
+        assert llama_server.last_request("/v1/chat/completions")["body"]["thinking_budget_tokens"] == 7
+        httpx.post(base_url + "/v1/chat/completions", json={
+            **_body("openai-chat", "llama-test", False), "reasoning_effort": "none",
+            "chat_template_kwargs": {"enable_thinking": True, "x": 1},
+        })
+        sent = llama_server.last_request("/v1/chat/completions")["body"]
+        assert sent["chat_template_kwargs"] == {"enable_thinking": True, "x": 1}
+
+
+def test_llama_cpp_responses_ingress_maps_reasoning_effort(llama_server: FakeLlamaServer) -> None:
+    with router_config(_llama_only_config(llama_server)) as base_url:
+        response = httpx.post(base_url + "/v1/responses", json={
+            **_body("openai-responses", "llama-test", False), "reasoning": {"effort": "low"},
+        })
+        assert response.status_code == 200, response.text
+        sent = llama_server.last_request("/v1/chat/completions")["body"]
+        assert sent["thinking_budget_tokens"] == 2048
+        assert "reasoning_effort" not in sent and "reasoning" not in sent
+
+
+def test_non_llama_passthrough_keeps_reasoning_effort(upstream: FakeUpstream) -> None:
+    with router(upstream) as base:
+        httpx.post(base + "/v1/chat/completions", json={
+            "model": "m-chat", "messages": [{"role": "user", "content": "hi"}],
+            "reasoning_effort": "high",
+        }, timeout=30)
+    sent = upstream.last_request("/v1/chat/completions")["body"]
+    assert sent["reasoning_effort"] == "high"
+    assert "thinking_budget_tokens" not in sent
+
+
 def test_llama_cpp_router_mode_context_from_launch_args() -> None:
     server = FakeLlamaServer(
         models=[

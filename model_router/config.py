@@ -189,6 +189,9 @@ class Provider:
     session_source_headers: tuple[str, ...] = _NATIVE_SESSION_HEADERS
     session_prompt_cache_key: bool = False
     session_missing: str = "omit"
+    # Discovered llama.cpp server: reasoning effort is mapped to its native
+    # thinking controls instead of being forwarded as reasoning_effort.
+    llama_cpp: bool = False
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "headers", _freeze(self.headers))

@@ -15,11 +15,30 @@ from .constants import (
     DIALECT_ANTHROPIC,
     DIALECT_OPENAI_CHAT,
     DIALECT_OPENAI_RESPONSES,
+    LLAMA_THINKING_BUDGETS,
     MAX_ERROR_MESSAGE,
 )
 
 if TYPE_CHECKING:
     from .streams import StreamState
+
+
+def _apply_llama_thinking(body: dict[str, Any], effort: Any) -> None:
+    """Map an OpenAI reasoning effort onto llama.cpp's native thinking fields.
+
+    Explicit native fields from the client always win. An unknown or "max"
+    effort adds nothing, leaving the server's own default behavior.
+    """
+    if not isinstance(effort, str):
+        return
+    if effort == "none":
+        kwargs = body.get("chat_template_kwargs")
+        if kwargs is None:
+            body["chat_template_kwargs"] = {"enable_thinking": False}
+        elif isinstance(kwargs, dict):
+            body["chat_template_kwargs"] = {"enable_thinking": False, **kwargs}
+    elif effort in LLAMA_THINKING_BUDGETS:
+        body.setdefault("thinking_budget_tokens", LLAMA_THINKING_BUDGETS[effort])
 
 
 class RouterError(Exception):

@@ -64,6 +64,13 @@ LLAMA_LIMIT_FIELDS = (
     "context_window", "trained_context_window", "max_input_tokens",
     "max_output_tokens", "default_output_tokens",
 )
+# llama.cpp has no reasoning_effort control; it takes a token budget
+# (thinking_budget_tokens) or chat_template_kwargs.enable_thinking instead. The
+# router maps the standard OpenAI effort onto those native fields. "max" is
+# deliberately absent: it means "no budget", i.e. the server default.
+LLAMA_THINKING_BUDGETS = {
+    "minimal": 1024, "low": 2048, "medium": 8192, "high": 16384, "xhigh": 32768,
+}
 REFRESH_BACKOFF_BASE = 5.0
 REFRESH_BACKOFF_MAX = 300.0
 

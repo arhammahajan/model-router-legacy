@@ -20,7 +20,7 @@ Every ingress can reach every upstream dialect — all twelve combinations are c
 | **OpenAI Responses** `/v1/responses` | LiteLLM bridge | pass-through | LiteLLM translate | LiteLLM translate |
 | **Anthropic Messages** `/v1/messages` | LiteLLM adapter | LiteLLM adapter | pass-through | LiteLLM adapter |
 
-Pass-through is byte-faithful for successful response bodies. HTTP error bodies use the redaction policy below. On the request side it rewrites only `model` and upstream auth/session headers, so provider-specific and beta fields (`cache_control`, `mcp_servers`, `reasoning`, `encrypted_content`, `previous_response_id`, custom vendor fields, …) survive a same-protocol hop.
+Pass-through is byte-faithful for successful response bodies. HTTP error bodies use the redaction policy below. On the request side it rewrites only `model` and upstream auth/session headers, so provider-specific and beta fields (`cache_control`, `mcp_servers`, `reasoning`, `encrypted_content`, `previous_response_id`, custom vendor fields, …) survive a same-protocol hop. The one exception is discovered llama.cpp servers, where OpenAI reasoning effort is mapped to native thinking controls (see [Thinking control](#llama-cpp-thinking-control)).
 
 Proxy forwarding removes hop-by-hop headers, including fields nominated by any `Connection` header. Client hop-only beta or session headers are not promoted into translated requests. Trusted upstream credentials and configured header defaults remain server-owned; outgoing representation headers describe the reserialized JSON body.
 
@@ -427,6 +427,18 @@ curl http://127.0.0.1:4000/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{"model":"Qwen3-8B-Q4_K_M","messages":[{"role":"user","content":"Hi"}]}'
 ```
+
+### llama.cpp thinking control
+
+llama.cpp has no `reasoning_effort` parameter; it takes a token budget or a chat-template toggle. For discovered llama.cpp models the router maps the standard OpenAI effort onto those native fields, so any client can use ordinary thinking levels:
+
+| `reasoning_effort` (Chat) / `reasoning.effort` (Responses) | Sent to llama.cpp |
+| --- | --- |
+| `none` | `chat_template_kwargs: {"enable_thinking": false}` |
+| `minimal` / `low` / `medium` / `high` / `xhigh` | `thinking_budget_tokens`: 1024 / 2048 / 8192 / 16384 / 32768 |
+| `max`, or any other value | nothing added; the server default applies |
+
+The effort field itself is removed from the request. A client-supplied `thinking_budget_tokens` or `chat_template_kwargs.enable_thinking` always wins over the mapping. This applies to the Chat pass-through and to translated Responses requests; Anthropic `thinking` still requires a native route. Models report `reasoning.effort.supported` with kind `configured` (source `router.llama_thinking_map`): that states the control exists, not that a given model produces thinking, so `reasoning.supported` stays whatever the upstream reported.
 
 Server provider identities are reserved for **all configured servers before probing**, including unreachable servers. Explicit `name` values must be unique and must not match a static `[providers]` name; duplicate names now fail configuration validation with the conflicting entries and a suggested fix. Omit `name` for a generated identity: the router normalizes the URL into `llama-…`, reserves all static and explicit names first, then resolves collisions with `-2`, `-3`, etc. in server configuration order. Reachability and probe completion order never change identities. Changing server order or configuration can change generated suffixes; use unique explicit names when identities must survive configuration edits.
 
