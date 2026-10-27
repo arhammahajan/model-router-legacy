@@ -12,11 +12,12 @@ from urllib.parse import parse_qs, urlsplit
 import pytest
 
 import model_router as mr
+import model_router.discovery as router_discovery
 
 
 def limits(row: Any = None, props: Any = None, mode: str = "single",
            **kwargs: Any) -> dict[str, Any]:
-    return mr._llama_limits(row or {}, props, mode, 12345, kwargs.pop("overrides", {}), **kwargs)
+    return router_discovery._llama_limits(row or {}, props, mode, 12345, kwargs.pop("overrides", {}), **kwargs)
 
 
 def test_conflicting_reports_keep_distinct_meanings() -> None:
@@ -93,7 +94,7 @@ def test_absent_or_malformed_props(props: Any) -> None:
 ])
 def test_context_argument_forms(args: Any, expected: int | None) -> None:
     found = limits({"status": {"args": args}}, mode="router")
-    assert mr._llama_context_from_args(args) == expected
+    assert router_discovery._llama_context_from_args(args) == expected
     assert found["context_window"]["value"] == (expected or 12345)
     assert found["context_window"]["kind"] == ("inferred" if expected else "fallback")
     assert found["max_output_tokens"]["value"] is None

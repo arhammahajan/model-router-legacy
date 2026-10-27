@@ -12,6 +12,8 @@ import httpx
 import pytest
 
 import model_router as mr
+import model_router.config as router_configuration
+import model_router.headers as router_headers
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -30,7 +32,7 @@ def bundled_raw(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
     monkeypatch.setenv("MODEL_ROUTER_API_KEY", "")
     monkeypatch.setenv("MODEL_ROUTER_API_KEYS", "")
     monkeypatch.delenv("LLAMA_SERVER_URL", raising=False)
-    return mr._load_config_file(ROOT / "router.toml")
+    return router_configuration._load_config_file(ROOT / "router.toml")
 
 
 @pytest.fixture
@@ -83,7 +85,7 @@ def test_bundled_mapping_matches_entire_reviewed_endpoint_table(bundled_app: mr.
         provider = app.provider(route.provider_name)
         assert route.upstream_model == model
         assert route.dialect == provider.dialect == expected["dialect"]
-        endpoint = mr._upstream_url(provider, route.dialect)
+        endpoint = router_headers._upstream_url(provider, route.dialect)
         if route.dialect == "gemini":
             endpoint += "/models/" + model
         assert endpoint == expected["endpoint"]
@@ -144,6 +146,8 @@ def test_unknown_catalog_models_are_diagnosed_without_dispatch(
     assert set(bundled_app.catalog_status()["unmapped_models"]) == UNMAPPED | new_models
     listed = {row["id"] for row in bundled_app.models_payload()["data"]}
     assert not listed & (UNMAPPED | new_models)
+    bundled_app.config.api_keys = ["dummy-router-diagnostics"]
+    auth = {"Authorization": "Bearer dummy-router-diagnostics"}
 
     server = mr.serve(bundled_app, "127.0.0.1", 0)
     thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01})
@@ -156,7 +160,7 @@ def test_unknown_catalog_models_are_diagnosed_without_dispatch(
                     "messages": [{"role": "user", "content": "Hi"}]}
             connection = http.client.HTTPConnection(*server.server_address, timeout=5)
             try:
-                connection.request("POST", path, json.dumps(body), {"Content-Type": "application/json"})
+                connection.request("POST", path, json.dumps(body), {"Content-Type": "application/json", **auth})
                 response = connection.getresponse()
                 data = json.loads(response.read())
                 assert response.status == 404
@@ -171,8 +175,9 @@ def test_unknown_catalog_models_are_diagnosed_without_dispatch(
                 connection.close()
         connection = http.client.HTTPConnection(*server.server_address, timeout=5)
         try:
-            connection.request("GET", "/health")
+            connection.request("GET", "/diagnostics", headers=auth)
             response = connection.getresponse()
+            assert response.status == 200
             assert set(json.loads(response.read())["catalog"]["unmapped_models"]) == UNMAPPED | new_models
         finally:
             connection.close()

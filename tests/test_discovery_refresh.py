@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import random
+
 import http.client
 import json
 import threading
@@ -14,6 +16,7 @@ from urllib.parse import urlsplit
 
 import httpx
 import pytest
+
 
 import model_router as mr
 
@@ -395,9 +398,7 @@ def test_http_liveness_listing_and_unknown_resolution_never_refresh(upstream: Lo
                     assert [row["id"] for row in body["data"]] == ["explicit"]
                 else:
                     assert response.status == 200
-                    assert body["status"] == "ok"
-                    assert body["catalog"]["loaded"] is False
-                    assert body["llama_cpp"]["loaded"] is False
+                    assert body == {"status": "ok"}
             finally:
                 connection.close()
 
@@ -523,7 +524,7 @@ def test_serve_owns_worker_start_and_stop(upstream: LocalDiscovery) -> None:
 
 def test_jitter_stays_in_bounded_backoff_range_and_varies(upstream: LocalDiscovery) -> None:
     with application(upstream) as (app, clock):
-        app._jitter = mr.random.Random(42).uniform
+        app._jitter = random.Random(42).uniform
         upstream.fail("catalog")
         clock.advance_to(10)
         delays = []

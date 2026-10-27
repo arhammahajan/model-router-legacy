@@ -1,0 +1,6 @@
+include CONTRIBUTING.md CAPABILITIES.md
+include requirements.txt constraints.txt
+include router.toml config.example.toml
+include model_router.py
+include scripts/check_release.py
+recursive-include tests *.py *.json *.md

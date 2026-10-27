@@ -123,6 +123,17 @@ marking them stale; age also increases without network activity when a refresh
 is blocked or overdue. Startup-only mode does not expire by interval, but a
 forced failed refresh still marks retained facts stale.
 
+With optional `[discovery_cache]` persistence, discovered entries also include
+`freshness.discovery.cached` and `succeeded_at` (Unix seconds of the successful
+observation). Imported inventory is always stale until live discovery replaces
+it. Its age includes time before restart; reconstructed monotonic timestamps can
+be negative. Local provenance is per server. Persistence keeps typed facts but
+omits freeform stop strings, source URLs/build strings, conflict histories and
+arbitrary upstream metadata. Current configuration supplies overrides and
+transport identity. `max_age_seconds` controls admission on restart; admitted
+routes retain the existing in-memory stale-route policy. See README for cache
+identity, invalidation, permissions and readiness limits.
+
 For local capabilities, applicable per-model `/props` reports take precedence
 over model-list architecture flags, then sparse operator overrides win.
 Conflicting lower-priority evidence remains in `conflicts`. Limits are copied

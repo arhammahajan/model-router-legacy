@@ -10,8 +10,12 @@
 [server]
 host = "127.0.0.1"
 port = 4000
-# Optional client-side auth for this router. Empty values are ignored.
-api_keys = ["${MODEL_ROUTER_API_KEY}"]
+# Intentional local unauthenticated mode. For client authentication use
+# auth_mode = "required" and api_keys = ["${MODEL_ROUTER_API_KEY}"].
+# Missing/empty substitutions fail startup; "none" ignores auth env variables.
+auth_mode = "none"
+# Only reviewed explicit/catalog/discovered routes; no provider/model bypass.
+allow_dynamic_routes = false
 max_body_bytes = 67108864
 
 # Bound admission before starting handlers; overloaded work gets HTTP 503.
@@ -24,7 +28,7 @@ write_timeout = 30              # seconds per downstream write, not stream durat
 
 # The public catalog supplies availability, not endpoint compatibility. Only
 # reviewed exact IDs below become routes. Unmapped IDs are omitted from
-# /v1/models, reported in /health catalog.unmapped_models, and rejected on use.
+# /v1/models, reported in authenticated /diagnostics catalog.unmapped_models, and rejected on use.
 [catalog]
 url = "https://opencode.ai/inference/go/v1/models"
 metadata_source = "opencode-go-v1" # bundled reviewed capabilities; availability stays live
@@ -73,6 +77,8 @@ dialect = "openai-chat"
 base_url = "https://opencode.ai/inference/go/openai/v1"
 api_key_env = "OPENCODE_API_KEY"
 session_header = "x-opencode-session"
+session_prompt_cache_key = true # explicit fallback; client must keep it per conversation
+session_missing = "omit"       # no supplied ID => no affinity; use "reject" to require one
 headers = { "User-Agent" = "litellm-model-router/0.3.0" }
 timeout = 600
 
@@ -81,6 +87,8 @@ dialect = "openai-responses"
 base_url = "https://opencode.ai/inference/go/openai/v1"
 api_key_env = "OPENCODE_API_KEY"
 session_header = "x-opencode-session"
+session_prompt_cache_key = true
+session_missing = "omit"
 headers = { "User-Agent" = "litellm-model-router/0.3.0" }
 timeout = 600
 
@@ -90,6 +98,8 @@ base_url = "https://opencode.ai/inference/go/anthropic"
 api_key_env = "OPENCODE_API_KEY"
 auth_header = "x-api-key"
 session_header = "x-opencode-session"
+session_prompt_cache_key = true
+session_missing = "omit"
 headers = { "User-Agent" = "litellm-model-router/0.3.0" }
 timeout = 600
 
@@ -99,6 +109,8 @@ base_url = "https://opencode.ai/inference/go/google/v1beta"
 api_key_env = "OPENCODE_API_KEY"
 auth_header = "bearer"
 session_header = "x-opencode-session"
+session_prompt_cache_key = true
+session_missing = "omit"
 headers = { "User-Agent" = "litellm-model-router/0.3.0" }
 timeout = 600
 

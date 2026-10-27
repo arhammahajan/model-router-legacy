@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import gzip
 import json
 import os
@@ -17,7 +19,11 @@ from urllib.parse import urlsplit
 import httpx
 import pytest
 
+
 import model_router as mr
+import model_router.adapters as router_adapters
+import model_router.headers as router_headers
+import model_router.protocol as router_protocol
 
 
 # ---------------------------------------------------------------------------
@@ -27,6 +33,7 @@ import model_router as mr
 ANTHROPIC_TEXT = "anthropic-upstream"
 CHAT_TEXT = "chat-upstream"
 RESPONSES_TEXT = "responses-upstream"
+GEMINI_TEXT = "gemini-upstream"
 
 
 def _gemini_response() -> dict[str, Any]:
@@ -148,7 +155,7 @@ def _responses_sse(text: str) -> list[tuple[str, dict[str, Any]]]:
         "tools": [],
     }
     completed = _responses_response(text)
-    return [
+    events = [
         ("response.created", {"type": "response.created", "response": base}),
         (
             "response.in_progress",
@@ -198,6 +205,9 @@ def _responses_sse(text: str) -> list[tuple[str, dict[str, Any]]]:
                 "text": text,
             },
         ),
+        ("response.content_part.done", {"type": "response.content_part.done",
+             "item_id": "msg_upstream", "output_index": 0, "content_index": 0,
+             "part": completed["output"][-1]["content"][0]}),
         (
             "response.output_item.done",
             {
@@ -209,6 +219,8 @@ def _responses_sse(text: str) -> list[tuple[str, dict[str, Any]]]:
         ("response.completed", {"type": "response.completed", "response": completed}),
     ]
 
+    return [(name, {**payload, "sequence_number": i})
+            for i, (name, payload) in enumerate(events)]
 
 def _chat_sse(text: str) -> list[str]:
     return [
@@ -300,6 +312,9 @@ class FakeUpstream:
         self.error_body: bytes | None = None
         self.error_status = 429
         self.stream_error: str | None = None
+        self.response_payload: dict[str, Any] | None = None
+        self.stream_frames: list[bytes] | None = None
+        self.error_headers: dict[str, str] = {}
         self._lock = threading.Lock()
         upstream = self
 
@@ -343,6 +358,8 @@ class FakeUpstream:
                     self.send_header("Content-Type", "application/json")
                     self.send_header("Content-Length", str(len(upstream.error_body)))
                     self.send_header("Retry-After", "0")
+                    for name, value in upstream.error_headers.items():
+                        self.send_header(name, value)
                     self.send_header("X-Upstream-Diagnostic", "Bearer do-not-forward")
                     self.end_headers()
                     self.wfile.write(upstream.error_body)
@@ -393,6 +410,8 @@ class FakeUpstream:
                     payload = _responses_response(RESPONSES_TEXT)
                 else:
                     payload = {"error": {"message": f"unknown path {path}"}}
+                if upstream.response_payload is not None:
+                    payload = upstream.response_payload
                 data = json.dumps(payload).encode()
                 self.send_response(200 if path in _PATHS or path.startswith("/v1beta/models/") else 404)
                 self.send_header("Content-Type", "application/json")
@@ -406,6 +425,11 @@ class FakeUpstream:
                 self.send_header("Connection", "close")
                 self.end_headers()
                 self.close_connection = True
+                if upstream.stream_frames is not None:
+                    for frame in upstream.stream_frames:
+                        self.wfile.write(frame)
+                        self.wfile.flush()
+                    return
                 if upstream.stream_error is not None:
                     error = {"type": "error", "error": {
                         "type": "api_error", "code": "upstream_error",
@@ -662,7 +686,7 @@ def router_config(config: dict[str, Any]) -> Iterator[str]:
 
 @contextmanager
 def router(upstream: FakeUpstream, **config_kwargs: Any) -> Iterator[str]:
-    with router_config(_config(upstream, **config_kwargs)) as base_url:
+    with router_config(_with_gemini(_config(upstream, **config_kwargs), upstream)) as base_url:
         yield base_url
 
 
@@ -675,7 +699,7 @@ def upstream() -> Iterator[FakeUpstream]:
         fake.stop()
 
 
-TARGETS = [("m-anth", ANTHROPIC_TEXT), ("m-chat", CHAT_TEXT), ("m-resp", RESPONSES_TEXT)]
+TARGETS = [("m-anth", ANTHROPIC_TEXT), ("m-chat", CHAT_TEXT), ("m-resp", RESPONSES_TEXT), ("m-gem", GEMINI_TEXT)]
 INGRESSES = ["openai-chat", "openai-responses", "anthropic"]
 
 PATHS = {
@@ -687,6 +711,7 @@ UPSTREAM_PATHS = {
     ANTHROPIC_TEXT: "/v1/messages",
     CHAT_TEXT: "/v1/chat/completions",
     RESPONSES_TEXT: "/v1/responses",
+    GEMINI_TEXT: "/v1beta/models/gemini-2.5-flash:generateContent",
 }
 
 
@@ -786,7 +811,9 @@ def _text_from_sse(ingress: str, text: str) -> str:
 def test_every_ingress_to_every_dialect_non_stream(
     upstream: FakeUpstream, ingress: str, model: str, expected_text: str
 ) -> None:
-    with router(upstream) as base:
+    raw_config = _with_gemini(_config(upstream), upstream)
+    raw_config["models"][2]["model"] = "gpt-4.1"  # exercise native Responses SSE
+    with router_config(raw_config) as base:
         response = httpx.post(
             base + PATHS[ingress],
             json=_body(ingress, model, stream=False),
@@ -796,11 +823,19 @@ def test_every_ingress_to_every_dialect_non_stream(
     payload = response.json()
     assert _text_from_response(ingress, payload) == expected_text
     upstream_request = upstream.last_request(UPSTREAM_PATHS[expected_text])
-    assert upstream_request["body"]["model"].startswith("upstream-")
+    if model == "m-gem":
+        assert upstream_request["body"]["contents"][0]["parts"] == [{"text": "hello"}]
+        assert upstream_request["body"]["generationConfig"]["max_output_tokens"] == 64
+    else:
+        assert upstream_request["body"]["model"] == {
+            "m-anth": "upstream-anthropic", "m-chat": "upstream-chat",
+            "m-resp": "gpt-4.1",
+        }[model]
     sent_headers = upstream_request["headers"]
     assert (
         sent_headers.get("authorization") == "Bearer upstream-key"
         or sent_headers.get("x-api-key") == "upstream-key"
+        or sent_headers.get("x-goog-api-key") == "upstream-key"
     ), sent_headers
 
 
@@ -809,7 +844,9 @@ def test_every_ingress_to_every_dialect_non_stream(
 def test_every_ingress_to_every_dialect_stream(
     upstream: FakeUpstream, ingress: str, model: str, expected_text: str
 ) -> None:
-    with router(upstream) as base:
+    raw_config = _with_gemini(_config(upstream), upstream)
+    raw_config["models"][2]["model"] = "gpt-4.1"  # exercise native Responses SSE
+    with router_config(raw_config) as base:
         with httpx.stream(
             "POST",
             base + PATHS[ingress],
@@ -820,8 +857,27 @@ def test_every_ingress_to_every_dialect_stream(
             raw = b"".join(response.iter_bytes()).decode()
     assert "text/event-stream" in response.headers.get("content-type", "")
     assert _text_from_sse(ingress, raw) == expected_text, raw[:1000]
+    events = _parse_sse(raw)
+    payloads = [json.loads(e["data"]) for e in events if e["data"] != "[DONE]"]
     if ingress == "openai-chat":
-        assert "[DONE]" in raw
+        assert events[-1] == {"data": "[DONE]"}
+        assert any(c.get("finish_reason") == "stop" for p in payloads for c in p.get("choices", []))
+    elif ingress == "openai-responses":
+        assert events[0]["event"] == "response.created"
+        assert events[-1]["event"] == "response.completed"
+        assert payloads[-1]["response"]["status"] == "completed"
+        assert [p["sequence_number"] for p in payloads] == list(range(len(payloads)))
+    else:
+        assert events[0]["event"] == "message_start"
+        assert events[-2]["event"] == "message_delta"
+        assert events[-1]["event"] == "message_stop"
+    path = UPSTREAM_PATHS[expected_text].replace(":generateContent", ":streamGenerateContent")
+    sent = upstream.last_request(path)["body"]
+    if model == "m-gem":
+        assert sent["contents"][0]["parts"] == [{"text": "hello"}]
+        assert sent["generationConfig"]["max_output_tokens"] == 64
+    else:
+        assert sent["stream"] is True
 
 
 def test_passthrough_preserves_unknown_fields_and_rewrites_model(
@@ -1035,7 +1091,7 @@ def test_validated_generation_extensions_and_trusted_merge(upstream: FakeUpstrea
 ])
 def test_generation_extensions_have_closed_typed_schemas(extension: Any) -> None:
     with pytest.raises(mr.RouterError) as exc:
-        mr._clean_request_params({"extra_body": extension}, "openai-chat")
+        router_protocol._clean_request_params({"extra_body": extension}, "openai-chat")
     assert exc.value.status == 400
 
 
@@ -1331,7 +1387,7 @@ def test_models_listing(upstream: FakeUpstream) -> None:
     assert response.status_code == 200
     payload = response.json()
     ids = {row["id"] for row in payload["data"]}
-    assert ids == {"m-anth", "m-chat", "m-resp"}
+    assert ids == {"m-anth", "m-chat", "m-resp", "m-gem"}
     assert payload["has_more"] is False
 
 
@@ -1342,7 +1398,7 @@ def test_health(upstream: FakeUpstream) -> None:
     assert response.json()["status"] == "ok"
 
 
-def test_streaming_upstream_error_becomes_ingress_error(upstream: FakeUpstream) -> None:
+def test_streaming_unknown_model_returns_local_lookup_error(upstream: FakeUpstream) -> None:
     """A missing route fails before any SSE bytes, with the right error shape."""
     with router(upstream) as base:
         response = httpx.post(
@@ -1449,19 +1505,19 @@ def test_anthropic_litellm_base_is_normalized(upstream: FakeUpstream) -> None:
 
 
 def test_url_construction() -> None:
-    assert mr._upstream_url(_provider("anthropic", "https://a.test"), "anthropic") == (
+    assert router_headers._upstream_url(_provider("anthropic", "https://a.test"), "anthropic") == (
         "https://a.test/v1/messages"
     )
-    assert mr._upstream_url(_provider("anthropic", "https://a.test/v1"), "anthropic") == (
+    assert router_headers._upstream_url(_provider("anthropic", "https://a.test/v1"), "anthropic") == (
         "https://a.test/v1/messages"
     )
-    assert mr._upstream_url(
+    assert router_headers._upstream_url(
         _provider("anthropic", "https://a.test/v1/messages"), "anthropic"
     ) == "https://a.test/v1/messages"
-    assert mr._upstream_url(_provider("openai-chat", "https://b.test/v1"), "openai-chat") == (
+    assert router_headers._upstream_url(_provider("openai-chat", "https://b.test/v1"), "openai-chat") == (
         "https://b.test/v1/chat/completions"
     )
-    assert mr._upstream_url(
+    assert router_headers._upstream_url(
         _provider("openai-responses", "https://c.test/v1"), "openai-responses"
     ) == "https://c.test/v1/responses"
 
@@ -1509,7 +1565,7 @@ def test_default_env_files_include_xdg(
     assert paths[0] == tmp_path / "ai" / "credentials.env"
 
 
-def test_session_header_is_generated_and_forwarded(upstream: FakeUpstream) -> None:
+def test_session_header_is_omitted_or_forwarded(upstream: FakeUpstream) -> None:
     with router(upstream) as base:
         first = httpx.post(
             base + "/v1/chat/completions",
@@ -1525,12 +1581,7 @@ def test_session_header_is_generated_and_forwarded(upstream: FakeUpstream) -> No
     assert first.status_code == 200 and second.status_code == 200
     headers = upstream.last_request("/v1/messages")["headers"]
     assert headers["x-opencode-session"] == "client-session-1"
-    generated = [
-        request["headers"]["x-opencode-session"]
-        for request in upstream.requests
-        if request["path"] == "/v1/messages"
-    ]
-    assert any(value.startswith("router-") for value in generated)
+    assert "x-opencode-session" not in upstream.requests[0]["headers"]
 
 
 def test_auth_header_injection() -> None:
@@ -1576,8 +1627,8 @@ def ambient_credentials(monkeypatch: pytest.MonkeyPatch) -> dict[str, str]:
     for name, value in values.items():
         monkeypatch.setenv(name, value)
     for name in ("api_key", "openai_key", "anthropic_key"):
-        monkeypatch.setattr(mr.litellm, name, "global-dummy-" + name)
-    monkeypatch.setattr(mr.litellm, "headers", {
+        monkeypatch.setattr(router_adapters.litellm, name, "global-dummy-" + name)
+    monkeypatch.setattr(router_adapters.litellm, "headers", {
         "Authorization": "Bearer global-dummy-header", "x-api-key": "global-dummy-header",
     })
     return values
@@ -1624,7 +1675,7 @@ def test_credentials_are_explicit_across_dialects(
     assert "global-dummy-" not in sent
     assert "ignored-duplicate-dummy-key" not in sent
     assert all(os.environ[name] == value for name, value in ambient_credentials.items())
-    assert mr.litellm.api_key == "global-dummy-api_key"
+    assert router_adapters.litellm.api_key == "global-dummy-api_key"
 
 
 def test_parallel_configured_and_uncredentialed_calls(
@@ -1783,7 +1834,7 @@ def test_redaction_precedes_length_limit_and_handles_escaped_values() -> None:
 def test_custom_auth_headers_use_selected_key(
     upstream: FakeUpstream, ambient_credentials: dict[str, str], header: str,
 ) -> None:
-    raw = _config(upstream)
+    raw = _with_gemini(_config(upstream), upstream)
     for provider in raw["providers"].values():
         provider["api_key"] = "selected-custom-dummy-key"
         provider["auth_header"] = header
@@ -1793,7 +1844,7 @@ def test_custom_auth_headers_use_selected_key(
                 response = httpx.post(base + PATHS[ingress],
                                       json=_body(ingress, model, False), timeout=30)
                 assert response.status_code == 200, response.text
-    assert len(upstream.requests) == 9
+    assert len(upstream.requests) == 12
     for request in upstream.requests:
         name = "authorization" if header == "bearer" else header
         expected = ("Bearer " if header == "bearer" else "") + "selected-custom-dummy-key"
@@ -1807,14 +1858,14 @@ def test_global_credentials_and_clients_fail_closed_without_mutation(
     upstream: FakeUpstream, monkeypatch: pytest.MonkeyPatch, setting: str,
 ) -> None:
     global_value = object()
-    monkeypatch.setattr(mr.litellm, setting, global_value)
+    monkeypatch.setattr(router_adapters.litellm, setting, global_value)
     with router(upstream) as base:
         response = httpx.post(base + PATHS["openai-chat"],
                               json=_body("openai-chat", "m-anth", False), timeout=10)
     assert response.status_code == 500
     assert "credential isolation" in response.json()["error"]["message"]
     assert not upstream.requests
-    assert getattr(mr.litellm, setting) is global_value
+    assert getattr(router_adapters.litellm, setting) is global_value
 
 
 def test_credentials_cannot_contain_litellm_environment_references(upstream: FakeUpstream) -> None:
@@ -2008,7 +2059,7 @@ def test_gemini_model_prefix_and_base(monkeypatch: pytest.MonkeyPatch) -> None:
             ],
         }
 
-    monkeypatch.setattr(mr.litellm, "completion", fake_completion)
+    monkeypatch.setattr(router_adapters.litellm, "completion", fake_completion)
     config = mr.build_config(
         {
             "server": {"port": 4000},
@@ -2033,7 +2084,7 @@ def test_gemini_model_prefix_and_base(monkeypatch: pytest.MonkeyPatch) -> None:
                 "model": "gemini-4-argon",
                 "messages": [{"role": "user", "content": "hi"}],
             },
-            {},
+            {"x-opencode-session": "gemini-conversation-1"},
         )
     finally:
         app.close()
@@ -2043,7 +2094,7 @@ def test_gemini_model_prefix_and_base(monkeypatch: pytest.MonkeyPatch) -> None:
     assert captured["api_key"] == "key"
     headers = captured["extra_headers"]
     assert headers["Authorization"] == "Bearer key"
-    assert headers["x-opencode-session"].startswith("router-")
+    assert headers["x-opencode-session"] == "gemini-conversation-1"
 
 
 # ---------------------------------------------------------------------------
@@ -2273,18 +2324,21 @@ def test_llama_cpp_unreachable_server_does_not_break_startup(
         sock.bind(("127.0.0.1", 0))
         closed_port = sock.getsockname()[1]
 
-    config = _config(upstream)
+    config = _config(upstream, api_keys=["diagnostics-test-key"])
     config["llama_cpp"] = {
         "servers": [f"http://127.0.0.1:{closed_port}"],
         "timeout": 0.2,
         "refresh_seconds": 0,
     }
     with router_config(config) as base_url:
-        health = httpx.get(base_url + "/health").json()
+        # Diagnostic inventory moved off the public liveness aliases.
+        health = httpx.get(base_url + "/diagnostics",
+                           headers={"Authorization": "Bearer diagnostics-test-key"}).json()
         assert health["status"] == "ok"
         assert health["llama_cpp"]["enabled"] is True
         assert health["llama_cpp"]["servers"][0]["reachable"] is False
-        ids = {item["id"] for item in httpx.get(base_url + "/v1/models").json()["data"]}
+        ids = {item["id"] for item in httpx.get(base_url + "/v1/models", headers={
+            "Authorization": "Bearer diagnostics-test-key"}).json()["data"]}
         assert "m-chat" in ids
         assert len(ids) == 3
 
@@ -2495,7 +2549,7 @@ def test_refresh_between_resolution_and_dispatch_pins_provider(
                     app.config.llama_cpp.servers.clear()
                 else:
                     old = app.config.llama_cpp.servers[0]
-                    app.config.llama_cpp.servers[0] = mr.replace(old, api_key="dummy-new-key")
+                    app.config.llama_cpp.servers[0] = replace(old, api_key="dummy-new-key")
                     server.models = [{"id": "new-model"}]
                 app.refresh_llama_cpp(force=True)
                 assert original_resolve("llama-test") is None

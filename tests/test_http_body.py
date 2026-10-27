@@ -10,6 +10,8 @@ from types import SimpleNamespace
 import pytest
 
 import model_router as mr
+import model_router.headers as router_headers
+import model_router.http as router_http
 
 
 class BodyReader(BytesIO):
@@ -190,8 +192,8 @@ def test_gzip_requires_one_complete_valid_member(wire: bytes) -> None:
 
 def test_gzip_accepts_exact_decompressed_limit() -> None:
     raw = b"x" * 64
-    assert mr._gunzip_limited(gzip.compress(raw), 64) == raw
-    assert mr._gunzip_limited(gzip.compress(b""), 64) == b""
+    assert router_http._gunzip_limited(gzip.compress(raw), 64) == raw
+    assert router_http._gunzip_limited(gzip.compress(b""), 64) == b""
 
 
 @pytest.mark.parametrize("chunked", [False, True])
@@ -222,7 +224,7 @@ def test_static_provider_headers_cannot_mislabel_reserialized_json() -> None:
                  "Content-Digest": "stale"},
     )
     translated = provider.litellm_call_kwargs()
-    for headers in (mr._upstream_request_headers(provider, mr.DIALECT_OPENAI_CHAT, {}),
+    for headers in (router_headers._upstream_request_headers(provider, mr.DIALECT_OPENAI_CHAT, {}),
                     translated["headers"], translated["extra_headers"]):
         lowered = {name.lower(): value for name, value in headers.items()}
         assert lowered["content-type"] == "application/json"

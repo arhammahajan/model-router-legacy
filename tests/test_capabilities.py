@@ -1,6 +1,8 @@
 """Versioned, advisory capabilities from offline evidence and local discovery."""
 from __future__ import annotations
 
+import time
+
 import json
 from datetime import datetime
 from pathlib import Path
@@ -9,6 +11,7 @@ from urllib.parse import parse_qs
 
 import httpx
 import pytest
+
 
 import model_router as mr
 import router_metadata as caps
@@ -312,7 +315,7 @@ def test_stale_metadata_and_availability_have_independent_clocks(monkeypatch: py
         initial = contract(app, "glm-5.3-flash")
         review = caps._go_review()
         expiry = datetime.fromisoformat(review["retrieved_at"].replace("Z", "+00:00")).timestamp() + review["stale_after_seconds"]
-        monkeypatch.setattr(mr.time, "time", lambda: expiry + 1)
+        monkeypatch.setattr(time, "time", lambda: expiry + 1)
         found = contract(app, "glm-5.3-flash")
         assert found["freshness"]["discovery"]["stale"] is False
         assert found["sources"]["go.review"]["stale"] is True

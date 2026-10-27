@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import time
+
 import http.client
 import json
 import queue
@@ -13,7 +15,9 @@ from typing import Any, Iterator
 import httpx
 import pytest
 
+
 import model_router as mr
+import model_router.http as router_http
 
 
 def config(**server: Any) -> mr.Config:
@@ -167,10 +171,10 @@ def test_deadline_is_absolute_even_with_continuous_progress(monkeypatch: pytest.
             now[0] += 0.4  # Every receive progresses before its inactivity timeout.
             buffer[0] = ord("x")
             return 1
-    monkeypatch.setattr(mr.time, "monotonic", lambda: now[0])
-    reader = mr._DeadlineReader(TrickleSocket())
+    monkeypatch.setattr(time, "monotonic", lambda: now[0])
+    reader = router_http._DeadlineReader(TrickleSocket())
     reader.deadline = 101.0
-    with pytest.raises(mr._ReadDeadlineExceeded):
+    with pytest.raises(router_http._ReadDeadlineExceeded):
         # One buffered call invokes multiple socket reads, each deadline checked.
         import io
         io.BufferedReader(reader).read(20)

@@ -7,7 +7,7 @@ import math
 from datetime import datetime, timezone
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Mapping, TypeGuard
 
 MODALITIES = ("text", "image", "audio", "video", "pdf", "embedding")
 PROTOCOLS = ("openai-chat", "openai-responses", "anthropic", "gemini")
@@ -31,7 +31,7 @@ def _number(value: Any) -> bool:
     return type(value) in (int, float) and math.isfinite(value)
 
 
-def _strings(value: Any) -> bool:
+def _strings(value: Any) -> TypeGuard[list[str] | tuple[str, ...]]:
     return (isinstance(value, (list, tuple)) and all(isinstance(v, str) and v for v in value)
             and len(set(value)) == len(value))
 

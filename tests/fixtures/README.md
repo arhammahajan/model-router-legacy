@@ -34,3 +34,51 @@ and endpoint fixtures do not establish model capabilities. See `CAPABILITIES.md`
 for the schema and deliberate review procedure; do not copy effort enums from
 other providers or infer controls from model names. No authenticated inference
 was performed in either review.
+
+## Protocol contract fixtures — prompt 15, reviewed 2026-10-27
+
+`test_protocol_contracts.py` builds small synthetic HTTP JSON/SSE fixtures from
+these official schemas; they are not recordings of paid inference:
+
+- [OpenAI Responses and usage](https://developers.openai.com/api/reference/resources/responses/methods/create)
+  and [streaming events](https://developers.openai.com/api/reference/resources/responses/streaming-events):
+  function-call IDs, argument delta/done events, input/output token details,
+  inline images and response lifecycle events.
+- [OpenAI Chat streaming](https://developers.openai.com/api/reference/resources/chat/subresources/completions/methods/create):
+  indexed tool-call deltas, JSON argument strings, a separate final usage chunk
+  with empty `choices`, and `[DONE]` termination.
+- [Anthropic streaming](https://platform.claude.com/docs/en/build-with-claude/streaming),
+  [tool use](https://platform.claude.com/docs/en/agents-and-tools/tool-use/implement-tool-use),
+  and [prompt caching](https://platform.claude.com/docs/en/build-with-claude/prompt-caching):
+  indexed content blocks, `input_json_delta`, thinking/signature deltas, cumulative
+  output usage, cache creation/read counts, and server-tool usage.
+- [Gemini GenerateContent](https://ai.google.dev/api/generate-content):
+  `contents`/`parts`, complete `functionCall`/`functionResponse` objects, inline
+  image data, thought parts, and `usageMetadata`. There are no invented partial
+  function-argument string deltas. Gemini 2.5's candidate count excludes thoughts;
+  the fixture has 12 prompt + 3 candidate + 2 thought = 17 total tokens, including
+  4 cached prompt tokens. LiteLLM emits snake_case request keys (`function_call`,
+  `inline_data`, `max_output_tokens`); these are valid original proto field names
+  under [ProtoJSON's field-name rules](https://protobuf.dev/programming-guides/json/#field-names-as-json-keys).
+- [OpenCode inference cost extensions](https://opencode.ai/v2/docs/console/api/inference#cost):
+  `cost`, `opencode.billing_source`, `list_cost`, `allowance`, and billed token
+  breakdown live inside native `usage` (Gemini uses `usageMetadata`). Stream
+  billing is attached to the final usage event. Native Chat/Responses/Messages
+  fidelity is tested; cross-protocol preservation of arbitrary billing extensions
+  is not promised.
+
+All credentials, signatures, IDs, token counts, billing amounts and model output
+are synthetic. The signatures test opaque transport, not cryptographic validity.
+The image is a one-pixel inline PNG, so no image URL needs fetching. Split tool
+arguments include Unicode and escaped quotes. Responses fixtures include ordered
+lifecycle/content/function events and explicit sequence numbers. Tests select a
+known Responses model to exercise upstream SSE rather than LiteLLM's simulated
+streaming fallback for unknown models. Terminal-error tests deliberately append
+an invalid success continuation after the error to detect accidental consumption
+or success fabrication; native passthrough remains opaque to that continuation.
+
+`tests/conftest.py` uses the installed LiteLLM cost map, disables telemetry, and
+rejects non-loopback socket connections. Adapter functions remain real. A few
+lifecycle tests wrap HTTP sends solely to observe response closure while still
+performing the real HTTP request. Explicit zero adapter retries make refusal
+contracts single-attempt; this does not define a new production retry policy.

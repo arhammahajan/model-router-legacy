@@ -1,7 +1,8 @@
 # Example configuration for model_router.py.
 #
 # Copy to router.toml (the default lookup name) and edit.
-# Every string supports ${ENV_VAR} expansion. The router also auto-loads
+# Every string supports ${ENV_VAR} expansion; missing/empty variables are errors.
+# The router also auto-loads
 # ~/.config/ai/credentials.env (or $XDG_CONFIG_HOME/ai/credentials.env) before
 # reading this file; existing environment variables win.
 
@@ -9,10 +10,15 @@
 host = "127.0.0.1"
 port = 4000
 
-# Optional. When non-empty, clients must send one of these as
-# "Authorization: Bearer <key>", "x-api-key: <key>" or "api-key: <key>".
-# Empty strings (for example from an unset ${VAR}) are ignored.
-api_keys = ["${MODEL_ROUTER_API_KEY}"]
+# Explicit local unauthenticated mode; ignores MODEL_ROUTER_API_KEY(S).
+auth_mode = "none"
+# To require client auth, replace the line above with:
+# auth_mode = "required"
+# api_keys = ["${MODEL_ROUTER_API_KEY}"] # missing/empty => startup error
+# Clients send Authorization: Bearer <key>, x-api-key: <key>, or api-key: <key>.
+
+# Compatibility default is true. False permits only explicit/discovered routes.
+allow_dynamic_routes = false
 
 # Optional request body limit, applied both before and after decompression.
 max_body_bytes = 67108864
@@ -24,6 +30,28 @@ header_read_timeout = 10        # absolute seconds for request line + headers
 body_read_timeout = 30          # absolute seconds for body + chunk framing
 write_timeout = 30              # seconds per downstream write, not stream duration
 # Provider timeout independently controls upstream generation/read waits.
+
+# One policy for direct forwarding and all LiteLLM translations. Attempts include
+# the initial send. Default 1 disables replay; opt in with max_attempts = 3.
+# A retry can duplicate generation/billing even after an upstream 429/503.
+[retry]
+max_attempts = 1                 # integer 1..20, same provider/model on every attempt
+statuses = [429, 503]            # only 429 or HTTP 5xx are configurable
+connect_errors = true           # retry ConnectError/ConnectTimeout before HTTP send
+backoff_base = 0.5               # exponential cap, seconds; jitter in [cap/2, cap]
+backoff_max = 8                  # cap excludes a longer Retry-After minimum
+deadline = 600                  # total dispatch + upstream IO + backoff + stream time
+# Retry-After seconds/HTTP dates are honored. Unaffordable waits return 504.
+# Read/write timeouts, truncated responses and SSE failures are never replayed.
+
+# Optional discovery persistence; omitted by default. Uncomment this table to
+# retain availability/selected metadata across restarts, with private POSIX files.
+# Endpoints/headers/credentials always come from current trusted configuration.
+# max_age_seconds limits admission on restart; admitted routes retain the existing
+# in-memory stale-route policy until successful discovery replaces/removes them.
+# [discovery_cache]
+# path = "~/.cache/model-router/discovery.json"
+# max_age_seconds = 86400
 
 # ---------------------------------------------------------------------------
 # Providers: one entry per upstream endpoint.
@@ -40,11 +68,12 @@ write_timeout = 30              # seconds per downstream write, not stream durat
 # For Gemini, include /v1beta in base_url.
 #
 # Credential isolation: a nonempty api_key/api_key_env/api_key_file selects that
-# key, with surrounding whitespace stripped. Missing/empty keys intentionally
+# key, with surrounding whitespace stripped. Omitted/literal empty api_key values
 # send the public "model-router-no-auth" placeholder in both passthrough and
 # translated requests; unauthenticated servers must accept/ignore it. Ambient
 # environment/global LiteLLM keys never act as fallbacks. Use api_key_env for
 # environment references (LiteLLM's os.environ/NAME indirection is rejected).
+# Configured api_key_env/api_key_file must resolve to a nonempty value.
 # The top-level key takes precedence over duplicates in litellm_kwargs.
 # Translation compatibility defaults to "strict": unsupported/unmapped controls
 # return HTTP 400. Explicit compatibility = "lossy" removes known losses and
@@ -55,9 +84,20 @@ write_timeout = 30              # seconds per downstream write, not stream durat
 #
 # auth_header (optional): "bearer", "x-api-key", or "api-key" to force how the
 #   upstream key is sent. Empty leaves the provider default.
-# session_header (optional): header to carry a per-request session id. If the
-#   client does not send it, the router generates one (or reuses
-#   prompt_cache_key). Useful for OpenCode Go.
+# session_header (optional): upstream stable conversation header, e.g.
+#   "x-opencode-session". Client must reuse one ID per conversation.
+# session_source_headers: ordered subset of reviewed native conversation headers.
+#   Default: ["x-claude-code-session-id", "session-id", "session_id", "thread-id",
+#             "conversation_id", "x-session-id"]. [] disables native extraction.
+#   Explicit session_header always wins; native sources precede the body fallback.
+# session_prompt_cache_key = false: opt in to top-level prompt_cache_key fallback.
+#   Reuse it per conversation; translated calls consume it as affinity metadata,
+#   native calls retain the JSON field. Cache keys shared across chats merge affinity.
+# session_missing = "omit": no identity => no session header/affinity. "reject"
+#   instead returns HTTP 400. No per-request UUID or prompt-derived ID is generated.
+#   These policy options require session_header. Static session headers are forbidden.
+#   Identity values: 1-256 ASCII letters/digits/._:/-, leading letter/digit; no
+#   whitespace or duplicates. See README for reviewed sources and compatibility.
 # ---------------------------------------------------------------------------
 
 [providers.anthropic]
@@ -100,7 +140,8 @@ api_key = "ollama"
 # metadata_source = "opencode-go-v1" # frozen reviewed capabilities; no Models.dev fetch
 # refresh_seconds = 300       # 0 = exactly one startup attempt, even on failure
 # # Failures retry with jittered exponential backoff (2.5–300 seconds).
-# # Model listing, resolution and health only read cached discovery state.
+# # Model listing, readiness and authenticated /diagnostics read cached state.
+# # /livez (also /health, /healthz) returns only status=ok without networking.
 #
 # [catalog.model_providers]
 # "claude-haiku-5-5" = "opencode-anthropic"
@@ -198,6 +239,8 @@ name = "local-llama"
 provider = "local"
 model = "llama3.1"
 
-# If a request names an unlisted model as "provider/model-id", the router sends
-# it to that provider using the provider's default dialect. For example:
+# With server.allow_dynamic_routes = true, an unlisted "provider/model-id" is
+# sent using that provider's default dialect. For example:
 #   model = "local/qwen2.5-coder:7b"
+# Disabled aliases alone are not a model access-control policy: dynamic IDs,
+# other aliases and discovered/catalog routes can still expose the same model.
