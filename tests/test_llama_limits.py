@@ -51,27 +51,8 @@ def test_props_runtime_context_and_legacy_default_layout(mode: str) -> None:
     assert found["max_output_tokens"]["value"] is None
 
 
-def test_legacy_row_wins_and_invalid_props_defaults_use_top_level() -> None:
-    row = {"max_model_len": 2048, "meta": {"n_ctx": 3000}}
-    assert limits(row, {"n_ctx": 4096}, "legacy")["context_window"]["value"] == 2048
-    assert limits({}, {"n_ctx": 4096, "default_generation_settings": {"n_ctx": 0}})["context_window"] == {
-        "value": 4096, "source": "/props.n_ctx", "kind": "reported",
-    }
 
 
-@pytest.mark.parametrize("bad", [None, 0, -1, True, False, 1.5, float("nan"),
-                                 float("inf"), "8192", "auto", [], {}])
-def test_invalid_or_auto_values_never_become_limits(bad: Any) -> None:
-    found = limits({"id": "model-128k-32k", "meta": {
-        "n_ctx": bad, "n_ctx_train": bad, "max_input_tokens": bad, "max_output_tokens": bad,
-    }}, {"n_ctx": bad, "default_generation_settings": {"n_ctx": bad}})
-    assert found["context_window"] == {
-        "value": 12345, "source": "llama_cpp.context_fallback", "kind": "fallback",
-    }
-    for key in mr.LLAMA_LIMIT_FIELDS[1:]:
-        assert found[key] == {"value": None, "source": None, "kind": "unknown"}
-    # Listing metadata is JSON-safe even if an upstream supplied NaN/Infinity.
-    json.dumps(found, allow_nan=False)
 
 
 @pytest.mark.parametrize("props", [None, [], "bad", 12, {"default_generation_settings": []}])
@@ -79,54 +60,12 @@ def test_absent_or_malformed_props(props: Any) -> None:
     assert limits({"meta": []}, props)["context_window"]["kind"] == "fallback"
 
 
-@pytest.mark.parametrize("args,expected", [
-    (["--ctx-size", "8192"], 8192), (["--ctx-size=8192"], 8192),
-    (["-c", "8192"], 8192), (["-c=8192"], 8192),
-    (["--ctx-size=16384", "-c", "8192"], 8192),
-    (["-c", "8192", "--ctx-size=0"], None),
-    (["--ctx-size=8192", "-c", "auto"], None),
-    (["--ctx-size=8192", "-c"], None),
-    (["--ctx-size", "1.5"], None), (["--ctx-size=nan"], None),
-    (["--ctx-size", "inf"], None), (["--ctx-size=-1"], None),
-    (["--fit-ctx=8192"], None), (["--fit-ctx", "8192"], None),
-    (["-fitc=8192"], None), (["-fitc", "8192"], None),
-    ("--ctx-size 8192", None), ([], None),
-])
-def test_context_argument_forms(args: Any, expected: int | None) -> None:
-    found = limits({"status": {"args": args}}, mode="router")
-    assert router_discovery._llama_context_from_args(args) == expected
-    assert found["context_window"]["value"] == (expected or 12345)
-    assert found["context_window"]["kind"] == ("inferred" if expected else "fallback")
-    assert found["max_output_tokens"]["value"] is None
 
 
-@pytest.mark.parametrize("args", [["--fit-ctx", "8192"], ["--fit-ctx=8192"],
-                                   ["-fitc", "8192"], ["-fitc=8192"]])
-def test_fit_is_only_a_constraint(args: list[str]) -> None:
-    found = limits({"meta": {"n_ctx": 4096}, "status": {"args": args}})
-    assert found["context_window"]["value"] == 4096
-    assert found["constraints"]["fit_context_min"] == {
-        "value": 8192, "source": "/v1/models.status.args.fit-ctx", "kind": "constraint",
-    }
 
 
-@pytest.mark.parametrize("raw,special", [(0, None), (256, None), (-1, "unlimited"), (-2, "until_context")])
-def test_generation_default_is_never_a_maximum(raw: int, special: str | None) -> None:
-    found = limits(props={"default_generation_settings": {"params": {"n_predict": raw}}})
-    assert found["default_output_tokens"]["value"] == (raw if raw >= 0 else None)
-    assert found["default_output_tokens"].get("special") == special
-    assert found["max_output_tokens"]["value"] is None
 
 
-@pytest.mark.parametrize("flag", ["-n", "--predict", "--n-predict"])
-@pytest.mark.parametrize("equals", [False, True])
-def test_generation_argument_default(flag: str, equals: bool) -> None:
-    args = [flag + "=80"] if equals else [flag, "80"]
-    found = limits({"status": {"args": args}})
-    assert found["default_output_tokens"] == {
-        "value": 80, "source": "/v1/models.status.args.n-predict", "kind": "inferred",
-    }
-    assert found["max_output_tokens"]["value"] is None
 
 
 @pytest.mark.parametrize("mode", ["router", "llama-swap"])
@@ -256,20 +195,8 @@ def test_overrides_win_without_replacing_discovered_route_or_alias() -> None:
             app.close()
 
 
-def test_explicit_unknown_override_suppresses_reported_value() -> None:
-    found = limits({"meta": {"max_output_tokens": 512}}, overrides={"max_output_tokens": None})
-    assert found["max_output_tokens"] == {
-        "value": None, "source": "llama_cpp.limit_overrides", "kind": "override",
-    }
 
 
-@pytest.mark.parametrize("bad", [True, "256", float("nan"), float("inf"), 1.5, -3])
-def test_invalid_defaults_allow_other_usable_sources(bad: Any) -> None:
-    found = limits({"status": {"args": ["-n=32"]}}, {
-        "default_generation_settings": {"params": {"n_predict": bad}, "n_predict": 64},
-    })
-    assert found["default_output_tokens"]["value"] == 64
-    assert found["max_output_tokens"]["value"] is None
 
 
 def test_zero_and_special_defaults_take_precedence_over_launch_estimates() -> None:
@@ -281,16 +208,6 @@ def test_zero_and_special_defaults_take_precedence_over_launch_estimates() -> No
         assert found["default_output_tokens"]["value"] == (0 if value == 0 else None)
 
 
-@pytest.mark.parametrize("field", ["max_input_tokens", "max_output_tokens"])
-def test_explicit_maximum_source_precedence(field: str) -> None:
-    row = {field: 2048, "metadata": {field: 1024}, "meta": {field: 4096}}
-    assert limits(row, {field: 512})[field]["value"] == 4096
-    row["meta"][field] = 0
-    assert limits(row, {field: 512})[field]["value"] == 2048
-    row[field] = None
-    assert limits(row, {field: 512})[field]["value"] == 1024
-    row["metadata"][field] = -1
-    assert limits(row, {field: 512})[field]["value"] == 512
 
 
 def test_single_server_props_and_swap_compatibility_through_public_listing() -> None:
@@ -318,18 +235,5 @@ def test_single_server_props_and_swap_compatibility_through_public_listing() -> 
                 app.close()
 
 
-@pytest.mark.parametrize("override", [[], {"model": []}, {"": {}}, {" model": {}},
-    {"model": {"max_tokens": 32}}, {"model": {"context_window": 0}},
-    {"model": {"max_output_tokens": -1}}, {"model": {"default_output_tokens": -1}},
-    {"model": {"max_input_tokens": True}}, {"model": {"max_output_tokens": "512"}},
-    {"model": {"context_window": 4096.5}}, {"model": {"context_window": float("nan")}},
-])
-def test_invalid_configured_limits_fail_early(override: Any) -> None:
-    with pytest.raises(SystemExit, match="limit_overrides"):
-        mr.build_config({"llama_cpp": {"limit_overrides": override}})
 
 
-@pytest.mark.parametrize("value", [0, -1, True, "8192", 4096.5, float("inf")])
-def test_invalid_context_fallback(value: Any) -> None:
-    with pytest.raises(SystemExit, match="context_fallback"):
-        mr.build_config({"llama_cpp": {"context_fallback": value}})

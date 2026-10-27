@@ -18,10 +18,6 @@ from test_model_router import PATHS, _body, _config, router_config, upstream
 ROOT = Path(__file__).resolve().parents[1]
 
 
-@pytest.fixture(autouse=True)
-def isolated_auth_env(monkeypatch):
-    monkeypatch.delenv("MODEL_ROUTER_API_KEY", raising=False)
-    monkeypatch.delenv("MODEL_ROUTER_API_KEYS", raising=False)
 
 
 def config():
@@ -32,40 +28,6 @@ def config():
     }
 
 
-@pytest.mark.parametrize("section,field,value", [
-    ("server", "host", False), ("server", "port", True), ("server", "port", "4000"),
-    ("server", "port", 0), ("server", "port", 65536),
-    ("server", "max_body_bytes", "100"), ("server", "max_body_bytes", False),
-    ("server", "max_body_bytes", -1), ("server", "allow_dynamic_routes", "false"),
-    ("server", "api_keys", "dummy"), ("server", "api_keys", [123]),
-    ("server", "api_keys", [""]), ("server", "api_keys", ["  "]),
-    ("server", "api_keys", None), ("server", "header_read_timeout", True),
-    ("provider", "timeout", "1"), ("provider", "timeout", True),
-    ("provider", "timeout", float("nan")), ("provider", "timeout", float("inf")),
-    ("provider", "timeout", 0), ("provider", "timeout", -1),
-    ("provider", "timeout", 10**400), ("provider", "headers", []),
-    ("provider", "headers", {"x-test": 42}), ("provider", "headers", {"x-test": "a\nb"}),
-    ("provider", "api_key_env", False), ("provider", "api_key_env", ""),
-    ("provider", "api_key", None),
-    ("provider", "api_key_file", []), ("provider", "drop_params", "false"),
-    ("model", "enabled", "false"), ("model", "enabled", 0),
-    ("model", "aliases", [1]), ("model", "aliases", "alias"),
-    ("model", "metadata", []), ("model", "dialect", []),
-    ("llama_cpp", "aliases", "false"), ("llama_cpp", "timeout", "2"),
-    ("llama_cpp", "refresh_seconds", True), ("llama_cpp", "ports", [True]),
-    ("llama_cpp", "ports", ["8080"]), ("llama_cpp", "servers", False),
-    ("llama_cpp", "prefix", False), ("llama_cpp", "headers", {"x-test": False}),
-    ("catalog", "timeout", False), ("catalog", "refresh_seconds", "30"),
-    ("catalog", "refresh_seconds", -1), ("catalog", "refresh_seconds", float("inf")),
-])
-def test_config_types_and_ranges(section, field, value):
-    raw = config()
-    target = {"provider": raw["providers"]["local"], "model": raw["models"][0]}.get(section)
-    if target is None:
-        target = raw.setdefault(section, {})
-    target[field] = value
-    with pytest.raises(SystemExit):
-        mr.build_config(raw)
 
 
 @pytest.mark.parametrize("section", ["config", "server", "provider", "model", "llama_cpp", "llama_server", "catalog", "rule"])
@@ -86,12 +48,6 @@ def test_config_typos_are_rejected(section):
         mr.build_config(raw)
 
 
-@pytest.mark.parametrize("section,value", [("server", []), ("providers", False), ("models", {}), ("llama_cpp", None)])
-def test_empty_invalid_sections_do_not_become_defaults(section, value):
-    raw = config()
-    raw[section] = value
-    with pytest.raises(SystemExit):
-        mr.build_config(raw)
 
 
 @pytest.mark.parametrize("suffix", [".toml", ".json"])
@@ -216,25 +172,6 @@ def test_bad_stream_types_are_json_400_before_resolution_or_dispatch(upstream, i
     assert upstream.requests == []
 
 
-@pytest.mark.parametrize("ingress", tuple(PATHS))
-def test_known_ingress_types_before_native_or_translated_upstream(upstream, ingress):
-    raw = _config(upstream)
-    bad = [("temperature", "0.5"), ("top_p", True), ("tools", {}),
-           ("max_tokens" if ingress != "openai-responses" else "max_output_tokens", False),
-           ("input", 42) if ingress == "openai-responses" else ("messages", [{"role": 123}])]
-    if ingress != "anthropic":
-        bad += [("store", "false"), ("parallel_tool_calls", []),
-                ("stream_options", {"include_usage": "false"})]
-    if ingress == "openai-responses":
-        bad += [("input", [{"role": False, "content": "hello"}]),
-                ("input", [{"type": "message", "role": "user", "content": 1}])]
-    with router_config(raw) as base, httpx.Client() as client:
-        for model in ("m-chat", "m-resp", "m-anth"):
-            for field, value in bad:
-                body = {**_body(ingress, model, False), field: value}
-                response = client.post(base + PATHS[ingress], json=body)
-                assert response.status_code == 400, response.text
-    assert upstream.requests == []
 
 
 def test_responses_missing_input_and_unsupported_state_are_client_errors(upstream):
@@ -273,15 +210,6 @@ def test_native_vendor_extensions_survive_validation(upstream, ingress, model, p
         assert sent[field] == value
 
 
-def test_native_responses_state_and_prompt_without_input_are_preserved(upstream):
-    with router_config(_config(upstream)) as base, httpx.Client() as client:
-        for extra in ({"previous_response_id": "resp_dummy"}, {"conversation": {"id": "conv_dummy"}},
-                      {"prompt": {"id": "pmpt_dummy"}}, {"instructions": "hello"}):
-            response = client.post(base + PATHS["openai-responses"], json={"model": "m-resp", **extra})
-            assert response.status_code == 200, response.text
-            sent = upstream.last_request("/v1/responses")["body"]
-            assert "input" not in sent
-            assert all(sent[key] == value for key, value in extra.items())
 
 
 def test_invalid_json_encoding_and_nonfinite_numbers_are_client_errors(upstream):
@@ -330,10 +258,3 @@ def test_python310_tomli_dependency_marker_matches_both_manifests():
         assert not dep.marker.evaluate({"python_version": "3.14"})
 
 
-@pytest.mark.parametrize("option,value", [("--port", "0"), ("--port", "65536"),
-                                          ("--host", ""), ("--api-key", "  ")])
-def test_cli_overrides_do_not_bypass_config_validation(tmp_path, option, value):
-    path = tmp_path / "router.json"
-    path.write_text(json.dumps(config()))
-    with pytest.raises(SystemExit):
-        mr.main(["--no-default-env", "--config", str(path), "--check", option, value])

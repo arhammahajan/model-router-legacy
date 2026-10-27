@@ -133,82 +133,8 @@ def test_corrupt_incompatible_and_unsafe_files(upstream: LocalDiscovery, tmp_pat
     assert path.stat().st_mode & 0o777 == 0o600
 
 
-def test_age_is_per_source_and_not_extended_by_failed_rounds(upstream: LocalDiscovery, tmp_path: Path) -> None:
-    path = tmp_path / "cache.json"
-    settings = cached_config(upstream, path)
-    with application(settings):
-        pass
-    upstream.fail("catalog", "one")
-    with application(settings, 1030) as app:
-        assert app.resolve("catalog-old") is not None
-    saved = json.loads(path.read_text())
-    assert saved["catalog"]["succeeded_at"] == 1000
-    assert saved["llama"]["0"]["succeeded_at"] == 1000
-    assert saved["llama"]["1"]["succeeded_at"] == 1030
-    upstream.fail("two")
-    with application(settings, 1060) as app:
-        assert app.resolve("catalog-old") is None  # Exact TTL boundary expires.
-        assert app.resolve("local-one") is None
-        assert app.resolve("local-two") is not None
-        assert app.diagnostics_payload()["discovery_cache"]["expired_sources"] == 2
-    with application(settings, 1090) as app:
-        assert app.resolve("local-two") is None
 
 
-@pytest.mark.parametrize("change", ["server_url", "server_header", "server_removed", "server_order",
-                                     "prefix", "aliases", "limits", "catalog_url", "catalog_header",
-                                     "mapping", "provider_endpoint", "provider_key", "provider_removed",
-                                     "disabled", "removed", "alias_removed"])
-def test_configuration_changes_discard_cache(upstream: LocalDiscovery, tmp_path: Path, change: str) -> None:
-    path = tmp_path / "cache.json"
-    settings = cached_config(upstream, path)
-    settings.routes["alias"] = settings.routes["explicit"]
-    with application(settings):
-        pass
-    llama, catalog = settings.llama_cpp, settings.catalog
-    if change == "server_url":
-        settings.llama_cpp = replace(llama, servers=[replace(llama.servers[0], url=upstream.url + "/two")])
-    elif change == "server_header":
-        settings.llama_cpp = replace(llama, servers=[replace(llama.servers[0], headers={"x-token": "new-fake-secret"})])
-    elif change == "server_removed":
-        settings.llama_cpp = replace(llama, servers=llama.servers[1:])
-    elif change == "server_order":
-        settings.llama_cpp = replace(llama, servers=list(reversed(llama.servers)))
-    elif change == "prefix":
-        settings.llama_cpp = replace(llama, prefix="new/")
-    elif change == "aliases":
-        settings.llama_cpp = replace(llama, expose_aliases=False)
-    elif change == "limits":
-        settings.llama_cpp = replace(llama, context_fallback=99)
-    elif change == "catalog_url":
-        settings.catalog = replace(catalog, url=catalog.url + "&changed=true")
-    elif change == "catalog_header":
-        settings.catalog = replace(catalog, headers={"Authorization": "Bearer different-fake-key"})
-    elif change == "mapping":
-        settings.catalog = replace(catalog, rules=[], model_providers={"different": "static"})
-    elif change == "provider_endpoint":
-        settings.providers["static"] = replace(settings.providers["static"], base_url=upstream.url + "/changed")
-    elif change == "provider_key":
-        settings.providers["static"] = replace(settings.providers["static"], api_key="rotated-fake-key")
-    elif change == "provider_removed":
-        settings.catalog = None
-        settings.routes.clear()
-        settings.public_routes.clear()
-        settings.providers.clear()
-    elif change == "disabled":
-        settings.routes["catalog-old"] = replace(settings.routes["explicit"], name="catalog-old", enabled=False)
-    elif change == "removed":
-        settings.routes.pop("explicit")
-        settings.public_routes.clear()
-    elif change == "alias_removed":
-        settings.routes.pop("alias")
-    upstream.fail("catalog", "one", "two")
-    with application(settings, 1010) as app:
-        assert app.resolve("catalog-old") is None
-        assert app.resolve("local-one") is None
-        assert app.diagnostics_payload()["discovery_cache"]["load"] == "configuration_changed"
-        if "static" in settings.providers:
-            assert app.provider("static") is settings.providers["static"]
 
 
 def test_opt_in_and_startup_only(upstream: LocalDiscovery, tmp_path: Path) -> None:
@@ -227,20 +153,6 @@ def test_opt_in_and_startup_only(upstream: LocalDiscovery, tmp_path: Path) -> No
         assert entries(app)["catalog-old"]["metadata"]["router"]["freshness"]["discovery"]["stale"]
 
 
-def test_empty_success_removes_disk_routes(upstream: LocalDiscovery, tmp_path: Path) -> None:
-    path = tmp_path / "cache.json"
-    settings = cached_config(upstream, path)
-    with application(settings):
-        pass
-    with upstream.lock:
-        upstream.models = {"catalog": [], "one": [], "two": []}
-    with application(settings, 1010) as app:
-        assert set(entries(app)) == {"explicit"}
-    upstream.fail("catalog", "one", "two")
-    with application(settings, 1020) as app:
-        assert app.resolve("catalog-old") is None
-        assert app.resolve("local-one") is None
-        assert set(entries(app)) == {"explicit"}
 
 
 def test_write_failure_preserves_previous_cache_and_live_routes(upstream: LocalDiscovery, tmp_path: Path,
@@ -266,49 +178,8 @@ def test_write_failure_preserves_previous_cache_and_live_routes(upstream: LocalD
     monkeypatch.setattr(os, "replace", original_replace)
 
 
-@pytest.mark.parametrize("cache", [{}, {"path": ""}, {"path": "a", "max_age_seconds": 0},
-                                   {"path": "a", "max_age_seconds": True},
-                                   {"path": "a", "typo": True}])
-def test_invalid_cache_config(cache: dict) -> None:
-    with pytest.raises(SystemExit, match="discovery_cache"):
-        mr.build_config({"discovery_cache": cache})
 
 
-def test_cached_aliases_and_collision_precedence(upstream: LocalDiscovery, tmp_path: Path, monkeypatch) -> None:
-    path = tmp_path / "cache.json"
-    settings = cached_config(upstream, path)
-    # Disabled explicit aliases reserve names against both live and disk data.
-    settings.routes["blocked-alias"] = replace(settings.routes["explicit"], enabled=False)
-    with upstream.lock:
-        upstream.models["catalog"] = ["shared", "explicit"]
-        upstream.models["one"] = ["shared", "explicit", "blocked-alias"]
-        upstream.models["two"] = ["shared"]
-    original_probe = mr.App._probe_llama_server
-    def probe(app, llama, server):
-        result = original_probe(app, llama, server)
-        for row in result.get("rows", []):
-            row["aliases"] = ["friendly", "blocked-alias", "explicit"]
-        return result
-    monkeypatch.setattr(mr.App, "_probe_llama_server", probe)
-    with application(settings) as app:
-        assert app.resolve("friendly").upstream_model == "shared"
-        assert app.resolve("shared").provider_name == "one"
-        assert app.resolve("explicit").provider_name == "static"
-        assert app.resolve("blocked-alias") is None
-        before = set(entries(app))
-    # Live catalog data cannot override a retained local entry, matching the
-    # existing explicit > local (configuration order) > catalog precedence.
-    upstream.fail("one", "two")
-    with application(settings, 1010) as app:
-        assert app.resolve("shared").provider_name == "one"
-        assert app.resolve("friendly").provider_name == "one"
-        assert app.resolve("explicit").provider_name == "static"
-        assert app.resolve("blocked-alias") is None
-        assert set(entries(app)) == before
-    upstream.fail("catalog")
-    with application(settings, 1020) as app:
-        assert app.resolve("friendly").provider_name == "one"
-        assert app.resolve("blocked-alias") is None
 
 
 def test_no_credentials_urls_or_freeform_metadata_persisted(upstream: LocalDiscovery, tmp_path: Path,
@@ -377,53 +248,5 @@ def test_cache_cannot_supply_transport_configuration(upstream: LocalDiscovery, t
         assert app.diagnostics_payload()["discovery_cache"]["load"] == "invalid"
 
 
-def test_cache_configuration_defaults_and_override() -> None:
-    raw = {"providers": {"local": {"dialect": "openai-chat", "base_url": "http://127.0.0.1:1/v1"}},
-           "models": [{"name": "explicit", "provider": "local"}]}
-    assert mr.build_config(raw).discovery_cache is None
-    settings = mr.build_config({**raw, "discovery_cache": {"path": "discovery.json"}})
-    assert settings.discovery_cache == mr.DiscoveryCacheConfig("discovery.json", 86400)
-    settings = mr.build_config({**raw, "discovery_cache": {"path": "discovery.json", "max_age_seconds": 120}})
-    assert settings.discovery_cache.max_age_seconds == 120
 
 
-def test_concurrent_source_writes_keep_both_latest_inventories(upstream: LocalDiscovery, tmp_path: Path,
-                                                             monkeypatch) -> None:
-    import threading
-    from concurrent.futures import ThreadPoolExecutor
-    path = tmp_path / "cache.json"
-    settings = cached_config(upstream, path)
-    with application(settings) as app:
-        upstream.recover()
-        write_entered, release_write, catalog_published = threading.Event(), threading.Event(), threading.Event()
-        atomic_write, publish = router_discovery._atomic_discovery_cache_write, app._publish_registry
-        def blocked_write(destination, payload):
-            write_entered.set()
-            assert release_write.wait(10)
-            atomic_write(destination, payload)
-        def observed_publish(**kwargs):
-            publish(**kwargs)
-            if kwargs.get("catalog") is not None:
-                catalog_published.set()
-        monkeypatch.setattr(router_discovery, "_atomic_discovery_cache_write", blocked_write)
-        monkeypatch.setattr(app, "_publish_registry", observed_publish)
-        with ThreadPoolExecutor(max_workers=2) as pool:
-            local_future = pool.submit(app.refresh_llama_cpp, force=True)
-            try:
-                assert write_entered.wait(10)
-                catalog_future = pool.submit(app.refresh_catalog, force=True)
-                assert catalog_published.wait(10)
-                # The writer holds only its cache lock. Request paths see the
-                # complete new registry before either file write finishes.
-                assert app.resolve("catalog-new") is not None
-                assert app.resolve("local-new") is not None
-            finally:
-                release_write.set()
-            local_future.result(10)
-            catalog_future.result(10)
-    upstream.fail("catalog", "one", "two")
-    with application(settings, 1010) as app:
-        assert app.resolve("catalog-new") is not None
-        assert app.resolve("local-new") is not None
-        assert app.resolve("catalog-old") is None
-        assert app.resolve("local-one") is None

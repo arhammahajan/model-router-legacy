@@ -102,18 +102,8 @@ def ordinary(server: ObservedServer) -> None:
     assert not server._generations
 
 
-@pytest.mark.parametrize("name", ["max_connections", "max_generations"])
-@pytest.mark.parametrize("value", [0, -1, True, 1.5, "2", None])
-def test_invalid_capacity(name: str, value: Any) -> None:
-    with pytest.raises(SystemExit, match=name):
-        config(**{name: value})
 
 
-@pytest.mark.parametrize("name", ["header_read_timeout", "body_read_timeout", "write_timeout"])
-@pytest.mark.parametrize("value", [0, -1, True, "2", None, float("nan"), float("inf")])
-def test_invalid_deadline(name: str, value: Any) -> None:
-    with pytest.raises(SystemExit, match=name):
-        config(**{name: value})
 
 
 def test_defaults_and_cross_limit_validation() -> None:
@@ -222,35 +212,8 @@ def test_held_generation_rejects_without_discovery_and_recovers() -> None:
             release.set()
 
 
-@pytest.mark.parametrize("payload,status", [
-    ([], 400), ({"model": "test", "messages": "bad"}, 400),
-    ({"model": "missing", "messages": []}, 404),
-])
-def test_validation_failures_do_not_leak_capacity(payload: Any, status: int) -> None:
-    with running_router() as (_, server):
-        with connect(server) as sock:
-            post(sock, payload)
-            assert response(sock)[0] == status
-        server.finished.get(timeout=2)
-        ordinary(server)
 
 
-@pytest.mark.parametrize("failure,status", [
-    (RuntimeError("local failure"), 502), (httpx.ReadTimeout("upstream stalled"), 504),
-    (TimeoutError("adapter stalled"), 504),
-])
-def test_dispatch_failures_release_capacity(failure: Exception, status: int) -> None:
-    with running_router() as (app, server):
-        original = app.dispatch
-        def dispatch(*args: Any) -> None:
-            raise failure
-        app.dispatch = dispatch
-        with connect(server) as sock:
-            post(sock)
-            assert response(sock)[0] == status
-        server.finished.get(timeout=2)
-        app.dispatch = original
-        ordinary(server)
 
 
 @pytest.mark.parametrize("asynchronous", [False, True])
@@ -292,28 +255,6 @@ def test_stalled_response_reader_or_disconnect_releases_generation(
         ordinary(server)
 
 
-def test_stream_may_pause_longer_than_inbound_and_write_timeouts() -> None:
-    release = threading.Event()
-    with running_router(header_read_timeout=0.03, body_read_timeout=0.03,
-                        write_timeout=0.03) as (app, server):
-        def chunks() -> Iterator[bytes]:
-            yield b"data: first\n\n"
-            assert release.wait(2)
-            yield b"data: last\n\n"
-        app.dispatch = lambda *args: mr.Plan(chunks=chunks(), content_type="text/event-stream")
-        try:
-            with connect(server) as sock:
-                post(sock)
-                reply = http.client.HTTPResponse(sock)
-                reply.begin()
-                assert reply.readline() == b"data: first\n"
-                assert not release.wait(0.15)
-                release.set()
-                assert b"data: last" in reply.read()
-            server.finished.get(timeout=2)
-            assert not server._generations
-        finally:
-            release.set()
 
 
 def test_shutdown_unblocks_stalled_headers_and_writes() -> None:

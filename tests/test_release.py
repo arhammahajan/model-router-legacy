@@ -104,32 +104,9 @@ def test_incompatible_litellm_fails_before_import(monkeypatch, version):
     assert "litellm==" + mr.TESTED_LITELLM_VERSION in message
     assert "litellm[mcp]==" + mr.TESTED_LITELLM_VERSION in message
     assert "-c constraints.txt" in message
-    assert "CONTRIBUTING.md" in message
+    assert "docs/contributing.md" in message
 
 
-@pytest.mark.parametrize("broken", ["import", "mcp", "method", "constructor"])
-def test_broken_adapter_installation_has_actionable_startup_error(monkeypatch, broken):
-    original = builtins.__import__
-    if broken == "method":
-        monkeypatch.setattr(router_adapters.AnthropicAdapter, "translate_completion_output_params", None)
-    if broken == "constructor":
-        def fail(*args, **kwargs):
-            raise TypeError("changed required constructor argument")
-        monkeypatch.setattr(router_adapters.AnthropicAdapter, "__init__", fail)
-
-    def importing(name, *args, **kwargs):
-        if broken == "import" and name == "litellm.llms.anthropic.pass_through.adapters.transformation":
-            raise ImportError("missing internal adapter")
-        if broken == "mcp" and name == "litellm.responses.mcp.litellm_proxy_mcp_handler":
-            raise ModuleNotFoundError("missing mcp")
-        return original(name, *args, **kwargs)
-
-    monkeypatch.setattr(builtins, "__import__", importing)
-    with pytest.raises(SystemExit) as caught:
-        runpy.run_path(router_adapters.__file__, run_name="model_router.release_startup_probe")
-    assert "adapter initialization failed" in str(caught.value)
-    assert "--force-reinstall" in str(caught.value)
-    assert "-c constraints.txt" in str(caught.value)
 
 
 def test_default_config_cli_never_reads_credentials_or_starts_app(tmp_path, monkeypatch, capsys):

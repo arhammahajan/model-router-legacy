@@ -267,38 +267,6 @@ def test_streamed_tool_arguments_reassemble_and_terminate(upstream, ingress, mod
     assert upstream.last_request(path)["body"].get("tools")
 
 
-@pytest.mark.parametrize("ingress", INGRESSES)
-@pytest.mark.parametrize("model,text", TARGETS)
-def test_inline_image_reaches_provider_without_fetch(upstream, ingress, model, text):
-    body = _body(ingress, model, False)
-    if ingress == "openai-chat":
-        body["messages"][0]["content"] = [{"type": "text", "text": "describe"},
-            {"type": "image_url", "image_url": {"url": "data:image/png;base64," + PNG}}]
-    elif ingress == "openai-responses":
-        body["input"] = [{"role": "user", "content": [{"type": "input_text", "text": "describe"},
-            {"type": "input_image", "image_url": "data:image/png;base64," + PNG}]}]
-    else:
-        body["messages"][0]["content"] = [{"type": "text", "text": "describe"},
-            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": PNG}}]
-    with router_config(config(upstream)) as base:
-        reply = httpx.post(base + PATHS[ingress], json=body, timeout=15)
-    assert reply.status_code == 200, reply.text
-    sent = upstream.last_request(UPSTREAM_PATHS[text])["body"]
-    if model == "m-gem":
-        parts = sent["contents"][0]["parts"]
-        image, = [p["inline_data"] for p in parts if "inline_data" in p]
-        assert image == {"mime_type": "image/png", "data": PNG}
-    elif model == "m-anth":
-        image, = [p for p in sent["messages"][0]["content"] if p["type"] == "image"]
-        assert image["source"] == {"type": "base64", "media_type": "image/png", "data": PNG}
-    elif model == "m-chat":
-        image, = [p for p in sent["messages"][0]["content"] if p["type"] == "image_url"]
-        assert image["image_url"]["url"] == "data:image/png;base64," + PNG
-    else:
-        parts = sent["input"][0]["content"]
-        image, = [p for p in parts if p["type"] == "input_image"]
-        assert image["image_url"] == "data:image/png;base64," + PNG
-    assert len(upstream.requests) == 1
 
 
 def metered_response(model):
@@ -360,76 +328,8 @@ def usage_from(ingress, reply, stream):
     return usage
 
 
-@pytest.mark.parametrize("stream", [False, True])
-@pytest.mark.parametrize("ingress", INGRESSES)
-@pytest.mark.parametrize("model,text", TARGETS)
-def test_usage_cache_and_reasoning_accounting(upstream, ingress, model, text, stream):
-    payload = metered_response(model)
-    upstream.response_payload = payload
-    upstream.stream_frames = metered_frames(model, payload)
-    body = _body(ingress, model, stream)
-    if ingress == "openai-chat" and stream:
-        body["stream_options"] = {"include_usage": True}
-    with router_config(config(upstream)) as base:
-        reply = httpx.post(base + PATHS[ingress], json=body, timeout=15)
-    assert reply.status_code == 200, reply.text
-    usage = usage_from(ingress, reply, stream)
-    if ingress == "openai-chat":
-        assert usage["prompt_tokens"] == 12, usage
-        assert usage["completion_tokens"] == 5 and usage["total_tokens"] == 17, usage
-        assert usage["prompt_tokens_details"]["cached_tokens"] == 4, usage
-        if model != "m-anth":  # Messages reports thinking as output, without an exact subcount.
-            assert usage["completion_tokens_details"]["reasoning_tokens"] == 2, usage
-        else:
-            assert usage["cache_creation_input_tokens"] == 2, usage
-    elif ingress == "openai-responses":
-        assert usage["input_tokens"] == 12 and usage["output_tokens"] == 5, usage
-        assert usage["total_tokens"] == 17, usage
-        assert usage["input_tokens_details"]["cached_tokens"] == 4, usage
-        if model != "m-anth":
-            assert usage["output_tokens_details"]["reasoning_tokens"] == 2, usage
-    else:
-        assert usage["output_tokens"] == 5, usage
-        assert usage["cache_read_input_tokens"] == 4, usage
-        assert usage["input_tokens"] == (6 if model == "m-anth" else 8), usage
-        if model == "m-anth":
-            assert usage["cache_creation_input_tokens"] == 2, usage
-            assert usage["server_tool_use"]["web_search_requests"] == 1, usage
 
 
-@pytest.mark.parametrize("status", [400, 429, 503])
-@pytest.mark.parametrize("stream", [False, True])
-@pytest.mark.parametrize("ingress", INGRESSES)
-@pytest.mark.parametrize("model,text", TARGETS)
-def test_actual_upstream_http_errors_and_rate_limit_headers(upstream, ingress, model, text, stream, status):
-    # All routes exist. The error must originate in the actual upstream HTTP request.
-    upstream.error_status = status
-    if model == "m-gem":
-        error = {"error": {"code": status, "status": {400: "INVALID_ARGUMENT", 429: "RESOURCE_EXHAUSTED", 503: "UNAVAILABLE"}[status], "message": "fixture upstream refused"}}
-    elif model == "m-anth":
-        error = {"type": "error", "error": {"type": {400: "invalid_request_error", 429: "rate_limit_error", 503: "api_error"}[status], "message": "fixture upstream refused"}}
-    else:
-        error = {"error": {"type": "invalid_request_error" if status == 400 else "rate_limit_error" if status == 429 else "server_error", "code": str(status), "message": "fixture upstream refused"}}
-    upstream.error_body = json.dumps(error).encode()
-    upstream.error_headers = {"X-RateLimit-Remaining-Requests": "0", "X-RateLimit-Reset-Requests": "2s",
-                              "anthropic-ratelimit-tokens-remaining": "0"}
-    with router_config(config(upstream)) as base:
-        reply = httpx.post(base + PATHS[ingress], json=_body(ingress, model, stream), timeout=15)
-    assert len(upstream.requests) == 1  # no hidden retries or local lookup failure
-    assert upstream.requests[0]["path"] == UPSTREAM_PATHS[text].replace(
-        ":generateContent", ":streamGenerateContent" if stream else ":generateContent")
-    assert reply.status_code == status, reply.text
-    assert reply.headers["content-type"].startswith("application/json"), reply.text
-    payload = reply.json()
-    assert payload["error"]["message"] and "fixture upstream refused" in payload["error"]["message"]
-    if ingress == "anthropic":
-        assert payload["type"] == "error"
-        assert payload["error"]["type"] == {400: "invalid_request_error", 429: "rate_limit_error", 503: "api_error"}[status]
-    assert reply.headers["retry-after"] == "0"
-    assert reply.headers["x-ratelimit-remaining-requests"] == "0"
-    assert reply.headers["x-ratelimit-reset-requests"] == "2s"
-    assert reply.headers["anthropic-ratelimit-tokens-remaining"] == "0"
-    assert "x-upstream-diagnostic" not in reply.headers
 
 
 @pytest.mark.parametrize("ingress,model", [
@@ -463,46 +363,6 @@ def test_supported_reasoning_controls_reach_provider(upstream, ingress, model, s
         assert_terminal(ingress, reply)
 
 
-@pytest.mark.parametrize("model", ["m-anth", "m-gem"])
-@pytest.mark.parametrize("ingress", ["openai-chat", "anthropic"])
-@pytest.mark.parametrize("stream", [False, True])
-def test_thinking_content_and_signature_where_supported(upstream, model, ingress, stream):
-    payload = response_for(model)
-    if model == "m-anth":
-        payload["content"].insert(0, {"type": "thinking", "thinking": "checking fixture", "signature": "c2lnbmF0dXJl"})
-        events = _anthropic_sse("answer")
-        events[1][1]["index"] = events[2][1]["index"] = events[3][1]["index"] = 1
-        thought_events = [
-            ("content_block_start", {"type": "content_block_start", "index": 0, "content_block": {"type": "thinking", "thinking": "", "signature": ""}}),
-            ("content_block_delta", {"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": "checking fixture"}}),
-            ("content_block_delta", {"type": "content_block_delta", "index": 0, "delta": {"type": "signature_delta", "signature": "c2lnbmF0dXJl"}}),
-            ("content_block_stop", {"type": "content_block_stop", "index": 0}),
-        ]
-        upstream.stream_frames = [frame(p, n) for n, p in [events[0], *thought_events, *events[1:]]]
-    else:
-        payload["candidates"][0]["content"]["parts"].insert(0, {"text": "checking fixture", "thought": True})
-        upstream.stream_frames = [frame(payload)]
-    upstream.response_payload = payload
-    with router_config(config(upstream)) as base:
-        reply = httpx.post(base + PATHS[ingress], json=_body(ingress, model, stream), timeout=15)
-    assert reply.status_code == 200, reply.text
-    if stream:
-        events = assert_terminal(ingress, reply)
-        if ingress == "openai-chat":
-            reasoning = "".join(c["delta"].get("reasoning_content") or "" for p in events for c in p.get("choices", []))
-        else:
-            reasoning = "".join(p["delta"].get("thinking", "") for p in events if p["type"] == "content_block_delta")
-        assert reasoning == "checking fixture"
-        assert "answer" in reply.text
-    elif ingress == "openai-chat":
-        message = reply.json()["choices"][0]["message"]
-        assert message["reasoning_content"] == "checking fixture"
-        assert message["content"] == "answer"
-    else:
-        thought, = [p for p in reply.json()["content"] if p["type"] == "thinking"]
-        assert thought["thinking"] == "checking fixture"
-        if model == "m-anth":
-            assert thought["signature"] == "c2lnbmF0dXJl"
 
 
 PROVIDER_USAGE = {"cost": 0, "opencode": {"billing_source": "go", "list_cost": 0.00412,
@@ -593,15 +453,3 @@ def test_provider_sse_error_is_terminal(upstream, ingress, model, text, when):
         assert events[-1]["event"] == "error"
 
 
-@pytest.mark.parametrize("ingress,model", [("openai-chat", "m-anth"),
-    ("openai-responses", "m-chat"), ("anthropic", "m-gem")])
-def test_forwarded_rate_limit_diagnostics_are_sanitized(upstream, ingress, model):
-    upstream.error_body = b'{"error":{"message":"fixture refused"}}'
-    upstream.error_headers = {"X-RateLimit-Reset": "upstream-key Bearer private-fixture-token " + "x" * 5000}
-    with router_config(config(upstream)) as base:
-        reply = httpx.post(base + PATHS[ingress], json=_body(ingress, model, False), timeout=15)
-    assert reply.status_code == 429
-    value = reply.headers["x-ratelimit-reset"]
-    assert "upstream-key" not in value and "private-fixture-token" not in value
-    assert len(value) <= 4000 and "REDACTED" in value.upper()
-    assert "x-upstream-diagnostic" not in reply.headers

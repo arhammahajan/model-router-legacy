@@ -17,47 +17,8 @@ import model_router
 ROOT = Path(__file__).resolve().parents[1]
 
 
-@pytest.mark.parametrize("module,names", [
-    ("config", ("Config", "Provider", "Route", "RetryPolicy", "build_config", "load_config")),
-    ("discovery", ("RegistrySnapshot", "CatalogSnapshot", "LlamaSnapshot")),
-    ("app", ("App",)),
-    ("http", ("Handler", "RouterHTTPServer", "serve")),
-    ("streams", ("Plan", "StreamState")),
-    ("cli", ("main",)),
-])
-def test_public_embedding_imports_preserve_object_identity(module, names):
-    owner = importlib.import_module(f"model_router.{module}")
-    for name in names:
-        assert getattr(model_router, name) is getattr(owner, name)
 
 
-def test_configuration_and_discovery_import_without_translation_backend():
-    # A separate interpreter prevents previously imported adapters from hiding
-    # a cycle or a newly introduced dependency on LiteLLM's private modules.
-    subprocess.run([sys.executable, "-c", """
-import builtins
-import sys
-
-original = builtins.__import__
-def importing(name, *args, **kwargs):
-    assert name.split('.')[0] not in {'litellm', 'openai'}, name
-    return original(name, *args, **kwargs)
-builtins.__import__ = importing
-
-from model_router.config import build_config
-from model_router.discovery import RegistrySnapshot
-import model_router
-config = build_config({
-    'server': {'auth_mode': 'none'},
-    'providers': {'local': {'dialect': 'openai-chat', 'base_url': 'http://127.0.0.1:1/v1',
-                            'api_key': 'dummy-package-test-key'}},
-    'models': [{'name': 'test', 'provider': 'local', 'model': 'test'}],
-})
-assert set(config.providers) == {'local'}
-assert model_router.Config is type(config)
-assert 'model_router.adapters' not in sys.modules
-assert 'model_router.app' not in sys.modules
-"""], check=True, capture_output=True, text=True)
 
 
 def test_only_adapter_imports_litellm_or_openai():

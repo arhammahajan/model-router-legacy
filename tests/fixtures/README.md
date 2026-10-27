@@ -30,7 +30,7 @@ Prompt 09's separate capability review is packaged in
 the same evidence. It contains exact Go-provider facts from Models.dev, source
 links pinned to the reviewed repository revision, the original API checksum,
 retrieval/review dates, and an independent 30-day freshness policy. Availability
-and endpoint fixtures do not establish model capabilities. See `CAPABILITIES.md`
+and endpoint fixtures do not establish model capabilities. See `docs/capabilities.md`
 for the schema and deliberate review procedure; do not copy effort enums from
 other providers or infer controls from model names. No authenticated inference
 was performed in either review.

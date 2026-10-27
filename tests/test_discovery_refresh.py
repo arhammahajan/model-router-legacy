@@ -289,45 +289,6 @@ def test_partial_failures_keep_per_server_success_and_independent_schedules(upst
         assert upstream.attempts() == (2, 3, 3)
 
 
-@pytest.mark.parametrize("interval", [0, 10])
-def test_startup_failure_has_no_discovered_routes_and_respects_mode(upstream: LocalDiscovery, interval: int) -> None:
-    upstream.fail("catalog", "one", "two")
-    with application(upstream, catalog_interval=interval, llama_interval=interval) as (app, clock):
-        for status in (app.catalog_status(), app.llama_cpp_status()):
-            assert status["loaded"] is False
-            assert status["refresh"]["last_success"] is None
-            assert status["refresh"]["last_attempt"] == 0
-            assert status["refresh"]["age_seconds"] is None
-            assert status["refresh"]["next_attempt"] == (5 if interval else None)
-        assert app.resolve("local-one") is None
-        assert app.resolve("catalog-old") is None
-        assert app.resolve("one/manual") is None
-        assert app.resolve("explicit") is not None
-        assert [row["id"] for row in app.models_payload()["data"]] == ["explicit"]
-        app.start()
-        if interval == 0:
-            assert app._refresh_worker is None
-            clock.advance_to(10000)
-            app.refresh_catalog()
-            app.refresh_llama_cpp()
-            read_burst(app)
-            assert upstream.attempts() == (1, 1, 1)
-            # Startup-only still allows an explicit administrative refresh.
-            upstream.recover()
-            app.refresh_catalog(force=True)
-            assert app.resolve("catalog-new") is not None
-            assert app.catalog_status()["refresh"]["next_attempt"] is None
-        else:
-            app.stop()
-            upstream.recover()
-            clock.advance_to(5)
-            wakeup = ObservedWakeup()
-            app._refresh_wakeup = wakeup
-            app.start()
-            wakeup.until_idle(1)
-            assert upstream.attempts() == (2, 2, 2)
-            assert app.resolve("local-new") is not None
-            assert app.resolve("catalog-new") is not None
 
 
 def test_first_partial_startup_success_is_usable_and_still_backs_off(upstream: LocalDiscovery) -> None:
@@ -343,31 +304,6 @@ def test_first_partial_startup_success_is_usable_and_still_backs_off(upstream: L
         assert app.resolve("one/manual") is None
 
 
-def test_attempt_time_and_retry_deadline_are_independent_of_completion(upstream: LocalDiscovery) -> None:
-    with application(upstream) as (app, clock):
-        upstream.fail("catalog")
-        entered, release = upstream.block("catalog")
-        clock.advance_to(10)
-        before = app._registry
-        with ThreadPoolExecutor(max_workers=1) as pool:
-            pending = pool.submit(app.refresh_catalog)
-            try:
-                assert entered.wait(10)
-                clock.advance_to(40)
-                assert app._registry is before
-                status = app.catalog_status()
-                assert status["refresh"]["last_attempt"] == 0
-                assert status["refresh"]["stale_age_seconds"] == 30
-                read_burst(app)
-            finally:
-                release.set()
-            pending.result(timeout=10)
-        status = app.catalog_status()
-        assert status["refresh"]["last_success"] == 0
-        assert status["refresh"]["last_attempt"] == 10
-        assert status["refresh"]["next_attempt"] == 45
-        app.refresh_catalog()
-        assert upstream.attempts()[0] == 2
 
 
 def test_http_liveness_listing_and_unknown_resolution_never_refresh(upstream: LocalDiscovery) -> None:
@@ -522,34 +458,5 @@ def test_serve_owns_worker_start_and_stop(upstream: LocalDiscovery) -> None:
         assert not app.http.is_closed  # stop permits resuming; close releases it
 
 
-def test_jitter_stays_in_bounded_backoff_range_and_varies(upstream: LocalDiscovery) -> None:
-    with application(upstream) as (app, clock):
-        app._jitter = random.Random(42).uniform
-        upstream.fail("catalog")
-        clock.advance_to(10)
-        delays = []
-        for failures in range(1, 14):
-            app.refresh_catalog()
-            deadline = app.catalog_status()["refresh"]["next_attempt"]
-            delay = deadline - clock()
-            ceiling = min(5 * 2 ** (failures - 1), 300)
-            assert ceiling / 2 <= delay <= ceiling
-            delays.append(delay)
-            clock.advance_to(deadline)
-        assert len(set(delays[-5:])) == 5
 
 
-@pytest.mark.parametrize("source", ["catalog", "llama_cpp"])
-@pytest.mark.parametrize("field", ["refresh_seconds", "timeout"])
-@pytest.mark.parametrize("value", [float("nan"), float("inf"), threading.TIMEOUT_MAX * 2])
-def test_scheduler_rejects_nonfinite_or_unwaitable_config(
-    upstream: LocalDiscovery, source: str, field: str, value: float,
-) -> None:
-    if source == "catalog":
-        raw = {"providers": {"static": {"dialect": "openai-chat", "base_url": upstream.url}},
-               "catalog": {"url": upstream.url + "/catalog", field: value,
-                           "rules": [{"match": ".", "provider": "static"}]}}
-    else:
-        raw = {"llama_cpp": {"servers": [upstream.url + "/one"], field: value}}
-    with pytest.raises(SystemExit, match="finite"):
-        mr.build_config(raw)

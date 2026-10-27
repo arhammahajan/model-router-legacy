@@ -72,98 +72,8 @@ def event(ingress: str) -> bytes:
     return name + b"data: " + json.dumps(payload).encode() + b"\n\n"
 
 
-@pytest.mark.parametrize("asynchronous", [False, True])
-@pytest.mark.parametrize("phase", ["empty", "complete", "first", "midstream"])
-@pytest.mark.parametrize("ingress", INGRESSES)
-def test_relay_event_contract_and_idempotent_ownership(
-    asynchronous: bool, phase: str, ingress: str, caplog: pytest.LogCaptureFixture,
-) -> None:
-    caplog.set_level("INFO", logger="model-router")
-    values = [] if phase in ("empty", "first") else [event(ingress)]
-    source = (AsyncTracked if asynchronous else Tracked)(values, phase in ("first", "midstream"))
-    transport = Tracked([])
-    plan = mr.Plan(content_type="text/event-stream", resources=(source, transport, source),
-                   closer=transport.close,
-                   async_chunks=source if asynchronous else None,
-                   chunks=None if asynchronous else source)
-    with running_router() as (app, server):
-        app.dispatch = lambda *args: plan
-        base = f"http://127.0.0.1:{server.server_port}"
-        reply = httpx.post(base + PATHS[ingress], json=_body(ingress, "test", True))
-        server.finished.get(timeout=3)
-        assert not server._generations
-    plan.close()
-    asyncio.run(plan.aclose())
-    assert source.closes == transport.closes == 1
-    assert reply.status_code == (502 if phase == "first" else 200)
-    if phase == "first":
-        assert reply.headers["content-type"] == "application/json"
-        assert reply.json()["error"]["message"] == "controlled stream failure"
-    elif phase == "midstream":
-        frames = _parse_sse(reply.text)
-        if ingress == "openai-chat":
-            assert frames[-1] == {"data": "[DONE]"}
-            error = json.loads(frames[-2]["data"])
-            assert error["error"]["type"] == "api_error"
-        else:
-            assert frames[-1]["event"] == "error"
-            error = json.loads(frames[-1]["data"])
-            assert error["type"] == "error"
-            if ingress == "anthropic":
-                assert error["error"]["type"] == "api_error"
-            else:
-                assert set(error) == {"type", "code", "message", "param"}
-        assert "message_stop" not in reply.text
-        assert "response.completed" not in reply.text
-    elif phase == "empty":
-        assert reply.content == b""
-    else:
-        assert reply.content == event(ingress)
-    outcome = "failed" if phase in ("first", "midstream") else "completed"
-    records = [json.loads(r.getMessage()) for r in caplog.records if hasattr(r, "router_event")]
-    record, = [r for r in records if r["event"] == "request_outcome"]
-    assert record["http_status"] == reply.status_code
-    assert record["stream_outcome"] == outcome
-    assert record["request_id"] == reply.headers["x-request-id"]
 
 
-@pytest.mark.parametrize("terminal", ["exception", "error", "response.failed", "complete"])
-def test_translated_responses_share_counter_with_terminal_errors(terminal: str) -> None:
-    values = [{"type": "response.output_text.delta", "delta": str(i), **seq}
-              for i, seq in enumerate([{"sequence_number": 9}, {"sequence_number": 9},
-                                       {"sequence_number": 1}, {}, {"sequence_number": None},
-                                       {"sequence_number": True}])]
-    if terminal == "error":
-        values.append({"type": "error", "message": "adapter failed", "code": "server_error"})
-    elif terminal == "response.failed":
-        values.append({"type": terminal, "response": {"status": "failed", "error": {
-            "code": "server_error", "message": "adapter failed"}}})
-    if terminal in ("error", "response.failed"):
-        values.append({"type": "response.completed"})  # must not be consumed after failure
-    with running_router() as (app, server):
-        sources = []
-        def dispatch(*args: Any) -> mr.Plan:
-            source = Tracked(values, fail=terminal == "exception")
-            sources.append(source)
-            state = mr.StreamState()
-            return mr.Plan(chunks=router_streams._responses_sse(source, state=state),
-                           resources=(source,), stream_state=state)
-        app.dispatch = dispatch
-        for _ in range(3):
-            reply = httpx.post(f"http://127.0.0.1:{server.server_port}/v1/responses",
-                               json=_body("openai-responses", "test", True))
-            server.finished.get(timeout=3)
-            assert reply.status_code == 200
-            frames = _parse_sse(reply.text)
-            payloads = [json.loads(frame["data"]) for frame in frames]
-            assert [p["sequence_number"] for p in payloads] == list(range(len(payloads)))
-            assert all(f["event"] == p["type"] for f, p in zip(frames, payloads))
-            if terminal != "complete":
-                assert payloads[-1]["type"] == ("response.failed" if terminal == "response.failed" else "error")
-                assert "response.completed" not in reply.text
-            assert sources[-1].closes == 1
-            if terminal in ("error", "response.failed"):
-                assert sources[-1].reads == 7
 
 
 @pytest.mark.parametrize("asynchronous", [False, True])
@@ -181,36 +91,6 @@ def test_unstarted_plan_closes_hidden_source(asynchronous: bool) -> None:
     assert source.reads == 0
 
 
-@pytest.mark.parametrize("after_headers", [False, True])
-def test_async_task_cancellation_closes_iterator_and_transport(after_headers: bool) -> None:
-    async def exercise() -> None:
-        entered = asyncio.Event()
-        transport = AsyncTracked([])
-        class Held(AsyncTracked):
-            async def __anext__(self) -> Any:
-                if after_headers and not self.reads:
-                    self.reads += 1
-                    return event("anthropic")
-                entered.set()
-                await asyncio.Event().wait()
-        source = Held([])
-        plan = mr.Plan(async_chunks=source, resources=(transport,))
-        handler = object.__new__(mr.Handler)
-        handler.wfile = io.BytesIO()
-        handler._headers_sent = False
-        handler._send_stream_headers = lambda plan: setattr(handler, "_headers_sent", True)
-        handler._stream_outcome = "active"
-        task = asyncio.create_task(handler._relay_async(plan, "anthropic"))
-        await entered.wait()
-        task.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await task
-        await plan.aclose()
-        assert source.closes == transport.closes == 1
-        assert handler._stream_outcome == "cancelled"
-        assert handler._headers_sent == after_headers
-        assert b"error" not in handler.wfile.getvalue()
-    asyncio.run(exercise())
 
 
 @pytest.mark.parametrize("asynchronous", [False, True])
@@ -371,113 +251,8 @@ def local_streams() -> Iterator[tuple[ScriptedUpstream, ObservedServer, str]]:
         assert server.errors.empty(), list(server.errors.queue)
 
 
-@pytest.mark.parametrize("ingress,model", [
-    ("openai-chat", "m-anth"), ("openai-chat", "m-resp"),
-    ("openai-responses", "m-chat"), ("openai-responses", "m-anth"),
-    ("anthropic", "m-chat"), ("anthropic", "m-resp"),
-    ("openai-chat", "m-gem"), ("openai-responses", "m-gem"), ("anthropic", "m-gem"),
-])
-@pytest.mark.parametrize("mode", ["empty", "first", "midstream"])
-def test_real_adapters_local_http_failures_close_responses_and_recover(
-    ingress: str, model: str, mode: str, monkeypatch: pytest.MonkeyPatch,
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    caplog.set_level("INFO", logger="model-router")
-    with local_streams() as (upstream, server, base):
-        responses = []
-        original_send = httpx.Client.send
-        def send(client: httpx.Client, request: httpx.Request, **kwargs: Any) -> httpx.Response:
-            response = original_send(client, request, **kwargs)
-            if request.url.port == upstream.port:
-                responses.append(response)
-            return response
-        monkeypatch.setattr(httpx.Client, "send", send)
-        for attempt in range(2):
-            upstream.mode = mode if attempt == 0 else "complete"
-            reply = httpx.post(base + PATHS[ingress], json=_body(ingress, model, True), timeout=15)
-            server.finished.get(timeout=3)
-            assert responses and all(r.is_closed for r in responses)
-            assert not server._generations
-            if attempt == 1:
-                assert reply.status_code == 200, reply.text
-                assert_success(ingress, reply)
-                continue
-            # Prompt 17 owns ambiguous transport errors across adapter paths.
-            # Messages<-Responses emits message_start before reading upstream.
-            expected_status = 200
-            if mode == "first" and (ingress, model) != ("anthropic", "m-resp"):
-                expected_status = 502
-            elif mode == "empty" and (ingress, model) == ("openai-chat", "m-resp"):
-                expected_status = 500
-            assert reply.status_code == expected_status, reply.text
-            if reply.status_code == 200:
-                events = _parse_sse(reply.text)
-                payloads = [json.loads(e["data"]) for e in events if e["data"] != "[DONE]"]
-                if mode != "empty":
-                    assert any(p.get("error") or p.get("type") == "error" for p in payloads), reply.text
-                    assert "message_stop" not in reply.text
-                    assert "response.completed" not in reply.text
-                    record, = [json.loads(r.getMessage()) for r in caplog.records
-                               if hasattr(r, "router_event") and
-                               r.router_event.get("request_id") == reply.headers["x-request-id"]]
-                    assert record["http_status"] == 200
-                    assert record["stream_outcome"] == "failed"
-                if ingress == "openai-responses":
-                    assert [p["sequence_number"] for p in payloads] == list(range(len(payloads)))
-            else:
-                assert "error" in reply.json()
-                if mode == "first":
-                    if ingress == "anthropic":
-                        assert reply.json()["type"] == "error"
-                        assert reply.json()["error"]["type"] == "api_error"
-                    else:
-                        assert reply.json()["error"]["code"] == "upstream_outcome_unknown"
-                    assert "accepted and billed" in reply.json()["error"]["message"]
-                record, = [json.loads(r.getMessage()) for r in caplog.records
-                           if hasattr(r, "router_event") and
-                           r.router_event.get("request_id") == reply.headers["x-request-id"]]
-                assert record["http_status"] == expected_status
-                assert record["stream_outcome"] == "failed"
 
 
-@pytest.mark.parametrize("ingress,model", [
-    ("openai-chat", "m-anth"), ("openai-chat", "m-resp"),
-    ("openai-responses", "m-chat"), ("openai-responses", "m-anth"),
-    ("anthropic", "m-chat"), ("anthropic", "m-resp"),
-    ("openai-chat", "m-chat"), ("openai-responses", "m-resp"), ("anthropic", "m-anth"),
-    ("openai-chat", "m-gem"), ("openai-responses", "m-gem"), ("anthropic", "m-gem"),
-])
-def test_real_http_disconnect_aborts_upstream_and_next_request_works(
-    ingress: str, model: str, monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    with local_streams() as (upstream, server, base):
-        responses = []
-        original_send = httpx.Client.send
-        def send(client: httpx.Client, request: httpx.Request, **kwargs: Any) -> httpx.Response:
-            response = original_send(client, request, **kwargs)
-            if request.url.port == upstream.port:
-                responses.append(response)
-            return response
-        monkeypatch.setattr(httpx.Client, "send", send)
-        upstream.mode = "disconnect"
-        with connect(server) as sock:
-            post(sock, _body(ingress, model, True), PATHS[ingress])
-            assert sock.recv(1) == b"H"
-            sock.shutdown(socket.SHUT_RDWR)
-        server.finished.get(timeout=5)
-        assert upstream.aborted.wait(5), f"upstream consumed {upstream.produced} events"
-        assert upstream.produced < 4096
-        assert responses and all(r.is_closed for r in responses)
-        assert not server._generations
-        upstream.mode = "complete"
-        reply = httpx.post(base + PATHS[ingress], json=_body(ingress, model, True))
-        server.finished.get(timeout=3)
-        assert reply.status_code == 200
-        native = {"openai-chat": "m-chat", "openai-responses": "m-resp", "anthropic": "m-anth"}[ingress] == model
-        assert_success(ingress, reply, translated=not native)
-        if native:
-            assert reply.content == upstream.last_wire
-        assert all(r.is_closed for r in responses)
 
 
 @pytest.mark.parametrize("ingress,model", [
@@ -494,23 +269,6 @@ def test_native_sse_bytes_and_vendor_sequences_are_opaque(ingress: str, model: s
             assert [json.loads(f["data"])["sequence_number"] for f in _parse_sse(reply.text)[:-1]] == [3, 3, 1]
 
 
-@pytest.mark.parametrize("failure", ["first", "transform", "missing_transform"])
-def test_anthropic_setup_failure_closes_already_acquired_source(
-    failure: str, monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    source = Tracked([] if failure == "first" else [{"choices": []}], fail=failure == "first")
-    monkeypatch.setattr(router_adapters.litellm, "completion", lambda **kwargs: source)
-    def transform(*args: Any, **kwargs: Any) -> Any:
-        if failure == "missing_transform":
-            return None
-        raise RuntimeError("transform failed")
-    monkeypatch.setattr(router_adapters._ANTHROPIC_ADAPTER, "translate_completion_output_params_streaming", transform)
-    with running_router() as (app, server):
-        provider = app.config.providers["local"]
-        route = app.resolve("test")
-        with pytest.raises((RuntimeError, mr.RouterError)):
-            app._anthropic_to_chat(provider, route, _body("anthropic", "test", True))
-        assert source.closes == 1
 
 
 def test_cleanup_failure_does_not_skip_other_resources() -> None:

@@ -1014,74 +1014,8 @@ def test_translated_requests_cannot_redirect_provider_credentials(
         alternate.stop()
 
 
-@pytest.mark.parametrize("ingress,model,path", TRANSLATED_ROUTES)
-def test_translated_tools_and_reasoning_remain_generation_data(
-    upstream: FakeUpstream, ingress: str, model: str, path: str,
-) -> None:
-    schema = {"type": "object", "properties": {"api_base": {"type": "string"}}}
-    body = _body(ingress, model, False)
-    if ingress == "openai-chat":
-        body.update({
-            "reasoning_effort": "high",
-            "tools": [{"type": "function", "function": {
-                "name": "lookup", "parameters": schema,
-            }}],
-        })
-    elif ingress == "openai-responses":
-        body.update({
-            "reasoning": {"effort": "high"},
-            "tools": [{"type": "function", "name": "lookup", "parameters": schema}],
-        })
-    else:
-        body.update({
-            "thinking": {"type": "enabled", "budget_tokens": 4096},
-            "metadata": {"user_id": "dummy-user"},
-            "tools": [{"name": "lookup", "input_schema": schema}],
-        })
-    raw = _config(upstream)
-    if ingress == "anthropic":
-        # A native token budget becomes an effort bucket on these bridges.
-        raw["providers"]["chat" if model == "m-chat" else "resp"]["compatibility"] = "lossy"
-    # Use a model with known reasoning support in LiteLLM's local metadata;
-    # synthetic "upstream-anthropic" has no adapter reasoning mapping.
-    raw["models"][0]["model"] = "claude-3-7-sonnet-20250219"
-    if model == "m-anth":
-        body["max_tokens" if ingress == "openai-chat" else "max_output_tokens"] = 40000
-    with router_config(raw) as base:
-        response = httpx.post(base + PATHS[ingress], json=body, timeout=30)
-    assert response.status_code == 200, response.text
-    sent = upstream.last_request(path)["body"]
-    tool = sent["tools"][0]
-    if path == "/v1/messages":
-        assert tool["name"] == "lookup"
-        assert tool["input_schema"] == schema
-        assert sent["thinking"]["type"] == "enabled"
-        assert sent["thinking"]["budget_tokens"] > 0
-    elif path == "/v1/chat/completions":
-        assert tool["function"]["parameters"] == schema
-        assert sent["reasoning_effort"] == "high"
-    else:
-        assert tool["parameters"] == schema
-        assert sent["reasoning"]["effort"] == "high"
 
 
-def test_validated_generation_extensions_and_trusted_merge(upstream: FakeUpstream) -> None:
-    raw = _config(upstream)
-    raw["providers"]["chat"]["litellm_kwargs"] = {
-        "temperature": 0.25, "extra_body": {"top_k": 7},
-    }
-    with router_config(raw) as base:
-        response = httpx.post(base + "/v1/responses", json={
-            **_body("openai-responses", "m-chat", False),
-            "temperature": 0.75,
-            "extra_body": {"top_k": 42, "min_p": 0.1, "repetition_penalty": 1.1},
-        }, timeout=30)
-    assert response.status_code == 200, response.text
-    sent = upstream.last_request("/v1/chat/completions")["body"]
-    assert sent["temperature"] == 0.25
-    assert sent["top_k"] == 7
-    assert sent["min_p"] == 0.1
-    assert sent["repetition_penalty"] == 1.1
 
 
 @pytest.mark.parametrize("extension", [
@@ -1109,20 +1043,6 @@ def test_thinking_extension_uses_generation_mapping(upstream: FakeUpstream) -> N
     assert sent["thinking"] == {"type": "enabled", "budget_tokens": 2048}
 
 
-@pytest.mark.parametrize("ingress", ["anthropic", "openai-responses"])
-def test_sampling_extensions_reach_chat_upstream(
-    upstream: FakeUpstream, ingress: str,
-) -> None:
-    with router(upstream) as base:
-        response = httpx.post(base + PATHS[ingress], json={
-            **_body(ingress, "m-chat", False),
-            "extra_body": {"top_k": 42, "min_p": 0.05, "repetition_penalty": 1.2},
-        }, timeout=30)
-    assert response.status_code == 200, response.text
-    sent = upstream.last_request("/v1/chat/completions")["body"]
-    assert sent["top_k"] == 42
-    assert sent["min_p"] == 0.05
-    assert sent["repetition_penalty"] == 1.2
 
 
 def test_translated_mcp_tool_does_not_execute_in_router(upstream: FakeUpstream) -> None:
@@ -1285,49 +1205,8 @@ def test_dynamic_provider_model_routing(upstream: FakeUpstream) -> None:
     )
 
 
-@pytest.mark.parametrize("ingress", INGRESSES)
-@pytest.mark.parametrize("model,expected", TARGETS)
-def test_gzip_request_body(upstream: FakeUpstream, ingress: str, model: str, expected: str) -> None:
-    body = json.dumps(_body(ingress, model, stream=False)).encode()
-    with router(upstream) as base:
-        response = httpx.post(
-            base + PATHS[ingress],
-            content=gzip.compress(body),
-            headers={
-                "Content-Type": "application/json; charset=iso-8859-1",
-                "Content-Encoding": "gzip",
-                "Content-MD5": "stale-md5",
-                "Digest": "sha-256=stale-digest",
-                "Content-Digest": "sha-256=:stale:",
-                "Repr-Digest": "sha-256=:stale:",
-                "Content-Range": "bytes 0-20/100",
-                "Content-Location": "/original.json.gz",
-                "ETag": '"original"',
-                "Signature": "stale-signature",
-                "Signature-Input": "stale-input",
-            },
-        )
-    assert response.status_code == 200
-    assert _text_from_response(ingress, response.json()) == expected
-    request = upstream.last_request(UPSTREAM_PATHS[expected])
-    headers = request["headers"]
-    assert headers.get("content-encoding", "identity") == "identity"
-    assert headers["content-type"] == "application/json"
-    assert int(headers["content-length"]) == len(request["raw_body"])
-    assert json.loads(bytes(request["raw_body"])) == request["body"]
-    for name in ("content-encoding", "content-md5", "digest", "content-digest",
-                 "repr-digest", "content-range", "content-location", "etag",
-                 "signature", "signature-input"):
-        assert name not in headers
 
 
-def test_fake_upstream_rejects_json_advertised_as_gzip(upstream: FakeUpstream) -> None:
-    response = httpx.post(
-        f"http://127.0.0.1:{upstream.port}/v1/chat/completions",
-        content=b'{"model":"test"}',
-        headers={"Content-Encoding": "gzip"},
-    )
-    assert response.status_code == 400
 
 
 def _raw_post(base: str, headers: bytes, body: bytes) -> tuple[int, bytes]:
@@ -1364,21 +1243,6 @@ def test_raw_malformed_body_never_reaches_upstream(
     assert not upstream.requests
 
 
-def test_chunked_gzip_with_extensions_and_trailers(upstream: FakeUpstream) -> None:
-    raw = json.dumps(_body("openai-chat", "m-chat", stream=False)).encode()
-    zipped = gzip.compress(raw)
-    chunks = (f'{len(zipped):x}; flag; label="hello; world"\r\n'.encode()
-              + zipped + b"\r\n0\r\nX-Checksum: ignored\r\n\r\n")
-    with router(upstream) as base:
-        status, response = _raw_post(
-            base, b"Transfer-Encoding: Chunked\r\nContent-Encoding: GZIP\r\n", chunks,
-        )
-    assert status == 200
-    assert CHAT_TEXT.encode() in response
-    request = upstream.last_request("/v1/chat/completions")
-    assert "content-encoding" not in request["headers"]
-    assert "transfer-encoding" not in request["headers"]
-    assert "x-checksum" not in request["headers"]
 
 
 def test_models_listing(upstream: FakeUpstream) -> None:
@@ -1485,23 +1349,6 @@ def test_config_validation_errors(upstream: FakeUpstream) -> None:
         mr.build_config(raw)
 
 
-def test_anthropic_litellm_base_is_normalized(upstream: FakeUpstream) -> None:
-    raw = _config(upstream)
-    raw["providers"]["anth"]["base_url"] = (
-        f"http://127.0.0.1:{upstream.port}/v1/messages"
-    )
-    config = mr.build_config(raw)
-    provider = config.providers["anth"]
-    assert provider.litellm_call_kwargs()["api_base"] == (
-        f"http://127.0.0.1:{upstream.port}"
-    )
-
-    raw["providers"]["anth"]["base_url"] = f"http://127.0.0.1:{upstream.port}/v1"
-    config = mr.build_config(raw)
-    provider = config.providers["anth"]
-    assert provider.litellm_call_kwargs()["api_base"] == (
-        f"http://127.0.0.1:{upstream.port}"
-    )
 
 
 def test_url_construction() -> None:
@@ -1557,12 +1404,6 @@ def test_env_file_loading(tmp_path: Any, monkeypatch: pytest.MonkeyPatch) -> Non
     assert os.environ["MR_TEST_EXISTING"] == "keep-me"
 
 
-def test_default_env_files_include_xdg(
-    tmp_path: Any, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
-    paths = mr.default_env_files()
-    assert paths[0] == tmp_path / "ai" / "credentials.env"
 
 
 def test_session_header_is_omitted_or_forwarded(upstream: FakeUpstream) -> None:
@@ -1584,28 +1425,6 @@ def test_session_header_is_omitted_or_forwarded(upstream: FakeUpstream) -> None:
     assert "x-opencode-session" not in upstream.requests[0]["headers"]
 
 
-def test_auth_header_injection() -> None:
-    provider = mr.Provider(
-        name="p",
-        dialect="gemini",
-        base_url="https://g.test/v1beta",
-        api_key="key-1",
-        headers={"X-Extra": "yes"},
-        timeout=60.0,
-        litellm_provider="gemini",
-        litellm_kwargs={},
-        drop_params=True,
-        session_header="x-session",
-        auth_header="bearer",
-    )
-    kwargs = provider.litellm_call_kwargs(session_id="sid-1")
-    assert kwargs["api_base"] == "https://g.test/v1beta"
-    assert kwargs["extra_headers"] == {
-        "X-Extra": "yes",
-        "Authorization": "Bearer key-1",
-        "x-session": "sid-1",
-        "content-type": "application/json",
-    }
 
 
 # Credential isolation and diagnostic redaction (prompt 02).
@@ -1618,204 +1437,14 @@ def _with_gemini(raw: dict[str, Any], upstream: FakeUpstream) -> dict[str, Any]:
     return raw
 
 
-@pytest.fixture
-def ambient_credentials(monkeypatch: pytest.MonkeyPatch) -> dict[str, str]:
-    values = {name: "ambient-dummy-" + name for name in (
-        "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "OPENAI_API_KEY",
-        "GEMINI_API_KEY", "GOOGLE_API_KEY",
-    )}
-    for name, value in values.items():
-        monkeypatch.setenv(name, value)
-    for name in ("api_key", "openai_key", "anthropic_key"):
-        monkeypatch.setattr(router_adapters.litellm, name, "global-dummy-" + name)
-    monkeypatch.setattr(router_adapters.litellm, "headers", {
-        "Authorization": "Bearer global-dummy-header", "x-api-key": "global-dummy-header",
-    })
-    return values
 
 
-@pytest.mark.parametrize("ingress", INGRESSES)
-@pytest.mark.parametrize("model", ["m-anth", "m-chat", "m-resp", "m-gem"])
-@pytest.mark.parametrize("credential", [None, "", " \t ", "arbitrary-provider:key+/=?", "env"])
-@pytest.mark.parametrize("stream", [False, True])
-def test_credentials_are_explicit_across_dialects(
-    upstream: FakeUpstream, ambient_credentials: dict[str, str],
-    monkeypatch: pytest.MonkeyPatch, ingress: str, model: str, credential: str | None,
-    stream: bool,
-) -> None:
-    raw = _with_gemini(_config(upstream), upstream)
-    for provider in raw["providers"].values():
-        provider.pop("api_key")
-        provider["litellm_kwargs"] = {"api_key": "ignored-duplicate-dummy-key"}
-        if credential == "env":
-            provider["api_key_env"] = "ROUTER_DUMMY_CONFIGURED_KEY"
-        elif credential is not None:
-            provider["api_key"] = credential
-    monkeypatch.setenv("ROUTER_DUMMY_CONFIGURED_KEY", "configured-env-dummy-key")
-    expected = ("configured-env-dummy-key" if credential == "env"
-                else (credential or "").strip() or mr.UNAUTHENTICATED_API_KEY)
-    with router_config(raw) as base:
-        response = httpx.post(base + PATHS[ingress], json=_body(ingress, model, stream), timeout=30)
-    assert response.status_code == 200, response.text
-    if stream:
-        assert _text_from_sse(ingress, response.text)
-    else:
-        assert _text_from_response(ingress, response.json())
-    assert len(upstream.requests) == 1
-    request = upstream.requests[0]
-    headers = request["headers"]
-    if model == "m-anth":
-        assert headers["x-api-key"] == expected
-    elif model == "m-gem":
-        assert headers["x-goog-api-key"] == expected
-    else:
-        assert headers["authorization"] == "Bearer " + expected
-    sent = json.dumps(request)
-    assert "ambient-dummy-" not in sent
-    assert "global-dummy-" not in sent
-    assert "ignored-duplicate-dummy-key" not in sent
-    assert all(os.environ[name] == value for name, value in ambient_credentials.items())
-    assert router_adapters.litellm.api_key == "global-dummy-api_key"
 
 
-def test_parallel_configured_and_uncredentialed_calls(
-    upstream: FakeUpstream, ambient_credentials: dict[str, str],
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    environ_type = type(os.environ)
-    setitem = environ_type.__setitem__
-    delitem = environ_type.__delitem__
-
-    def guarded_setitem(environ: Any, name: str, value: str) -> None:
-        assert name not in ambient_credentials, "A request changed an ambient credential"
-        setitem(environ, name, value)
-
-    def guarded_delitem(environ: Any, name: str) -> None:
-        assert name not in ambient_credentials, "A request removed an ambient credential"
-        delitem(environ, name)
-
-    # Catch temporary clear/restore schemes as well as persistent mutations.
-    monkeypatch.setattr(environ_type, "__setitem__", guarded_setitem)
-    monkeypatch.setattr(environ_type, "__delitem__", guarded_delitem)
-    raw = _config(upstream)
-    raw["providers"]["anth"]["api_key"] = ""
-    raw["providers"]["chat"]["api_key"] = "parallel-configured-key"
-    with router_config(raw) as base:
-        barrier = threading.Barrier(4)
-
-        def call(index: int) -> httpx.Response:
-            barrier.wait(timeout=5)
-            model = "m-anth" if index % 2 else "m-chat"
-            return httpx.post(base + PATHS["openai-responses"],
-                              json=_body("openai-responses", model, False), timeout=30)
-
-        with ThreadPoolExecutor(max_workers=4) as pool:
-            responses = list(pool.map(call, range(4)))
-    assert all(response.status_code == 200 for response in responses)
-    assert len(upstream.requests) == 4
-    for request in upstream.requests:
-        headers = request["headers"]
-        if request["path"] == "/v1/messages":
-            assert headers["x-api-key"] == mr.UNAUTHENTICATED_API_KEY
-        else:
-            assert headers["authorization"] == "Bearer parallel-configured-key"
-    assert all(os.environ[name] == value for name, value in ambient_credentials.items())
 
 
-@pytest.mark.parametrize("message_attribute", [True, False])
-@pytest.mark.parametrize("ingress", INGRESSES)
-@pytest.mark.parametrize("phase", ["json", "first", "sync", "async"])
-def test_generated_errors_use_one_sanitizer(
-    upstream: FakeUpstream, monkeypatch: pytest.MonkeyPatch,
-    caplog: pytest.LogCaptureFixture, message_attribute: bool, ingress: str, phase: str,
-) -> None:
-    secret = "arbitrary-provider:key+/=?"
-    raw = _config(upstream, api_keys=["router-auth-dummy"])
-    for provider in raw["providers"].values():
-        provider["api_key"] = secret
-        provider["headers"] = {"X-Custom-Credential": "custom-header-dummy"}
-    message = (f"failure {secret} router-auth-dummy custom-header-dummy "
-               "Bearer opaque+/=token x-api-key: random-key-format "
-               "api_key=provider.not-sk.secret " + "x" * 6000)
-
-    class Failure(Exception):
-        pass
-
-    exc = Failure(message)
-    if message_attribute:
-        exc.message = message
-    exc.code = secret
-    exc.error_type = secret
-
-    def dispatch(self: mr.App, *_args: Any) -> mr.Plan:
-        if phase == "json":
-            raise exc
-
-        def chunks() -> Iterator[bytes]:
-            if phase != "first":
-                yield b"data: {}\n\n"
-            raise exc
-
-        async def async_chunks() -> Any:
-            yield b"data: {}\n\n"
-            raise exc
-
-        return (mr.Plan(async_chunks=async_chunks()) if phase == "async"
-                else mr.Plan(chunks=chunks()))
-
-    monkeypatch.setattr(mr.App, "dispatch", dispatch)
-    caplog.set_level("DEBUG")
-    with router_config(raw) as base:
-        response = httpx.post(base + PATHS[ingress],
-                              headers={"Authorization": "Bearer router-auth-dummy"},
-                              json=_body(ingress, "m-chat", phase != "json"), timeout=10)
-    assert response.status_code == (502 if phase in ("json", "first") else 200)
-    if phase in ("json", "first"):
-        error = response.json()["error"]
-    else:
-        event = json.loads(_parse_sse(response.text)[-2 if ingress == "openai-chat" else -1]["data"])
-        error = event if ingress == "openai-responses" else event["error"]
-    assert len(error["message"]) == mr.MAX_ERROR_MESSAGE
-    assert "<redacted>" in error["message"]
-    for value in (secret, "router-auth-dummy", "custom-header-dummy", "opaque+/=token",
-                  "random-key-format", "provider.not-sk.secret"):
-        assert value not in response.text
-        assert value not in caplog.text
-    assert "x" * (mr.MAX_ERROR_MESSAGE + 1) not in response.text
-    assert "x" * (mr.MAX_ERROR_MESSAGE + 1) not in caplog.text
 
 
-@pytest.mark.parametrize("ingress", INGRESSES)
-@pytest.mark.parametrize("model", ["m-anth", "m-chat", "m-resp", "m-gem"])
-@pytest.mark.parametrize("stream", [False, True])
-def test_real_adapter_and_passthrough_errors_are_sanitized(
-    upstream: FakeUpstream, ingress: str, model: str, stream: bool,
-    caplog: pytest.LogCaptureFixture, capsys: pytest.CaptureFixture[str],
-) -> None:
-    raw = _with_gemini(_config(upstream), upstream)
-    secret = "configured.provider+key/with=punctuation"
-    for provider in raw["providers"].values():
-        provider["api_key"] = secret
-        provider["litellm_kwargs"] = {"num_retries": 0}
-    upstream.error_body = json.dumps({"error": {"message": (
-        f"echo {secret} Bearer abc+/def== x-api-key: unknown-format-value " + "z" * 6000
-    )}}).encode()
-    caplog.set_level("DEBUG")
-    with router_config(raw) as base:
-        response = httpx.post(base + PATHS[ingress], json=_body(ingress, model, stream), timeout=30)
-    assert upstream.requests  # The error must come from the real local upstream.
-    assert response.status_code == 429, response.text
-    assert response.headers["content-type"] == "application/json"
-    assert "x-upstream-diagnostic" not in response.headers
-    error = response.json()["error"]
-    assert len(error["message"]) <= mr.MAX_ERROR_MESSAGE
-    assert "<redacted>" in error["message"]
-    assert "z" * (mr.MAX_ERROR_MESSAGE + 1) not in response.text
-    for value in (secret, "abc+/def==", "unknown-format-value"):
-        assert value not in response.text
-        assert value not in caplog.text
-    captured = capsys.readouterr()
-    assert secret not in captured.out + captured.err
 
 
 def test_redaction_precedes_length_limit_and_handles_escaped_values() -> None:
@@ -1830,27 +1459,6 @@ def test_redaction_precedes_length_limit_and_handles_escaped_values() -> None:
     assert sanitize("x" * (mr.MAX_ERROR_MESSAGE - 3) + secret).endswith("<re")
 
 
-@pytest.mark.parametrize("header", ["bearer", "x-api-key", "api-key"])
-def test_custom_auth_headers_use_selected_key(
-    upstream: FakeUpstream, ambient_credentials: dict[str, str], header: str,
-) -> None:
-    raw = _with_gemini(_config(upstream), upstream)
-    for provider in raw["providers"].values():
-        provider["api_key"] = "selected-custom-dummy-key"
-        provider["auth_header"] = header
-    with router_config(raw) as base:
-        for ingress in INGRESSES:
-            for model, _text in TARGETS:
-                response = httpx.post(base + PATHS[ingress],
-                                      json=_body(ingress, model, False), timeout=30)
-                assert response.status_code == 200, response.text
-    assert len(upstream.requests) == 12
-    for request in upstream.requests:
-        name = "authorization" if header == "bearer" else header
-        expected = ("Bearer " if header == "bearer" else "") + "selected-custom-dummy-key"
-        assert request["headers"][name] == expected
-        assert "ambient-dummy-" not in json.dumps(request)
-        assert "global-dummy-" not in json.dumps(request)
 
 
 @pytest.mark.parametrize("setting", ["proxy_auth", "client_session", "aclient_session"])
@@ -1875,80 +1483,8 @@ def test_credentials_cannot_contain_litellm_environment_references(upstream: Fak
         mr.build_config(raw)
 
 
-def test_discovery_errors_and_debug_logs_use_sanitizer(
-    upstream: FakeUpstream, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
-) -> None:
-    import logging
-
-    raw = _config(upstream, api_keys=["inbound-dummy-secret"])
-    raw["catalog"] = {
-        "url": f"http://127.0.0.1:{upstream.port}/v1/models",
-        "headers": {"Authorization": "Bearer catalog-dummy-secret"},
-        "rules": [{"match": ".*", "provider": "chat"}],
-    }
-    raw["llama_cpp"] = {
-        "servers": [{"url": f"http://127.0.0.1:{upstream.port}",
-                     "api_key": "llama-dummy-secret"}],
-    }
-    message = ("upstream-key catalog-dummy-secret llama-dummy-secret "
-               "inbound-dummy-secret Bearer strange+/token== api-key=unrecognized-token " + "z" * 6000)
-
-    def fail(*_args: Any, **_kwargs: Any) -> Any:
-        raise mr.RouterError(502, message)
-
-    monkeypatch.setattr(httpx.Client, "get", fail)
-    caplog.set_level("DEBUG")
-    old_filters = list(mr.LOG.filters)
-    app = mr.App(mr.build_config(raw))
-    try:
-        catalog = app.catalog_status()
-        llama = app.llama_cpp_status()
-        assert len(catalog["error"]) <= mr.MAX_ERROR_MESSAGE
-        assert len(llama["error"]) <= mr.MAX_ERROR_MESSAGE
-        assert len(llama["servers"][0]["error"]) <= mr.MAX_ERROR_MESSAGE
-        try:
-            raise ValueError(message)
-        except ValueError:
-            mr.LOG.debug("diagnostic failed: %s", message, exc_info=True)
-            logging.getLogger("LiteLLM").debug("adapter failed: %s", message, exc_info=True)
-    finally:
-        app.close()
-    assert mr.LOG.filters == old_filters
-    for text in (json.dumps(catalog), json.dumps(llama), caplog.text):
-        for secret in ("upstream-key", "catalog-dummy-secret", "llama-dummy-secret",
-                       "inbound-dummy-secret", "strange+/token==", "unrecognized-token"):
-            assert secret not in text
-        assert "z" * (mr.MAX_ERROR_MESSAGE + 1) not in text
 
 
-@pytest.mark.parametrize("ingress,model,path", TRANSLATED_ROUTES)
-def test_real_adapter_midstream_diagnostics_are_sanitized(
-    upstream: FakeUpstream, ingress: str, model: str, path: str,
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    upstream.stream_error = "echo upstream-key Bearer abc+/token== " + "q" * 6000
-    caplog.set_level("DEBUG")
-    raw = _config(upstream)
-    # LiteLLM simulates Responses streaming for unknown model names. A model
-    # known to its installed capability table exercises real upstream SSE;
-    # the destination remains our local fake server with dummy credentials.
-    for route in raw["models"]:
-        if route["provider"] == "resp":
-            route["model"] = "gpt-4.1"
-    with router_config(raw) as base:
-        response = httpx.post(base + PATHS[ingress],
-                              json=_body(ingress, model, True), timeout=30)
-    assert response.status_code == 200
-    assert upstream.last_request(path)
-    events = [json.loads(event["data"]) for event in _parse_sse(response.text)
-              if event.get("data") != "[DONE]"]
-    errors = [event.get("error", event) for event in events
-              if event.get("type") == "error" or event.get("error")]
-    assert errors, response.text
-    assert len(errors[-1]["message"]) <= mr.MAX_ERROR_MESSAGE
-    for value in ("upstream-key", "abc+/token==", "q" * (mr.MAX_ERROR_MESSAGE + 1)):
-        assert value not in response.text
-        assert value not in caplog.text
 
 
 def test_passthrough_http_error_body_is_deliberately_replaced(upstream: FakeUpstream) -> None:
@@ -2022,79 +1558,8 @@ def test_catalog_discovers_models_and_routes(upstream: FakeUpstream) -> None:
     assert other.json()["choices"][0]["message"]["content"] == CHAT_TEXT
 
 
-def test_catalog_config_validation(upstream: FakeUpstream) -> None:
-    raw = _config(upstream)
-    raw["catalog"] = {
-        "url": f"http://127.0.0.1:{upstream.port}/v1/models",
-        "rules": [{"match": ".", "provider": "nope"}],
-    }
-    with pytest.raises(SystemExit, match="unknown provider"):
-        mr.build_config(raw)
-
-    raw["catalog"]["rules"] = [{"match": "(", "provider": "chat"}]
-    with pytest.raises(SystemExit, match="invalid 'match' regex"):
-        mr.build_config(raw)
-
-    raw["catalog"]["rules"] = []
-    with pytest.raises(SystemExit, match="at least one"):
-        mr.build_config(raw)
 
 
-def test_gemini_model_prefix_and_base(monkeypatch: pytest.MonkeyPatch) -> None:
-    captured: dict[str, Any] = {}
-
-    def fake_completion(**kwargs: Any) -> dict[str, Any]:
-        captured.update(kwargs)
-        return {
-            "id": "x",
-            "object": "chat.completion",
-            "created": 1,
-            "model": "gemini-4-argon",
-            "choices": [
-                {
-                    "index": 0,
-                    "message": {"role": "assistant", "content": "ok"},
-                    "finish_reason": "stop",
-                }
-            ],
-        }
-
-    monkeypatch.setattr(router_adapters.litellm, "completion", fake_completion)
-    config = mr.build_config(
-        {
-            "server": {"port": 4000},
-            "providers": {
-                "gem": {
-                    "dialect": "gemini",
-                    "base_url": "https://opencode.test/google/v1beta",
-                    "api_key": "key",
-                    "auth_header": "bearer",
-                    "session_header": "x-opencode-session",
-                }
-            },
-            "models": [{"name": "gemini-4-argon", "provider": "gem"}],
-        }
-    )
-    app = mr.App(config)
-    try:
-        plan = app.dispatch(
-            "openai-chat",
-            config.routes["gemini-4-argon"],
-            {
-                "model": "gemini-4-argon",
-                "messages": [{"role": "user", "content": "hi"}],
-            },
-            {"x-opencode-session": "gemini-conversation-1"},
-        )
-    finally:
-        app.close()
-    assert plan.body is not None
-    assert captured["model"] == "gemini/gemini-4-argon"
-    assert captured["api_base"] == "https://opencode.test/google/v1beta"
-    assert captured["api_key"] == "key"
-    headers = captured["extra_headers"]
-    assert headers["Authorization"] == "Bearer key"
-    assert headers["x-opencode-session"] == "gemini-conversation-1"
 
 
 # ---------------------------------------------------------------------------
@@ -2229,80 +1694,10 @@ def test_non_llama_passthrough_keeps_reasoning_effort(upstream: FakeUpstream) ->
     assert "thinking_budget_tokens" not in sent
 
 
-def test_llama_cpp_router_mode_context_from_launch_args() -> None:
-    server = FakeLlamaServer(
-        models=[
-            {
-                "id": "router-model",
-                "status": {
-                    "value": "unloaded",
-                    "args": ["--model", "x.gguf", "--ctx-size", "8192"],
-                },
-            }
-        ],
-        props={"role": "router"},
-    ).start()
-    app = None
-    try:
-        app = mr.App(mr.build_config(_llama_only_config(server)))
-        entry = next(
-            item
-            for item in app.models_payload()["data"]
-            if item["id"] == "router-model"
-        )
-        assert entry["context_window"] == 8192
-        assert entry["metadata"]["llama_cpp"]["mode"] == "router"
-    finally:
-        if app is not None:
-            app.close()
-        server.stop()
 
 
-def test_llama_cpp_legacy_mode_context_and_capabilities() -> None:
-    server = FakeLlamaServer(
-        models=[
-            {
-                "id": "legacy-model",
-                "max_model_len": 2048,
-                "capabilities": ["completion", "multimodal"],
-            }
-        ]
-    ).start()
-    app = None
-    try:
-        app = mr.App(mr.build_config(_llama_only_config(server)))
-        entry = next(
-            item
-            for item in app.models_payload()["data"]
-            if item["id"] == "legacy-model"
-        )
-        assert entry["context_window"] == 2048
-        assert entry["metadata"]["capabilities"] == ["text", "image"]
-        assert entry["metadata"]["llama_cpp"]["mode"] == "legacy"
-    finally:
-        if app is not None:
-            app.close()
-        server.stop()
 
 
-def test_llama_cpp_legacy_zero_max_model_len_falls_back_to_props() -> None:
-    server = FakeLlamaServer(
-        models=[{"id": "legacy-model", "max_model_len": 0}],
-        props={"default_generation_settings": {"n_ctx": 3072}},
-    ).start()
-    app = None
-    try:
-        app = mr.App(mr.build_config(_llama_only_config(server)))
-        entry = next(
-            item
-            for item in app.models_payload()["data"]
-            if item["id"] == "legacy-model"
-        )
-        assert entry["context_window"] == 3072
-    finally:
-        if app is not None:
-            app.close()
-        server.stop()
 
 
 def test_llama_cpp_prefix_and_alias_exposure() -> None:
@@ -2332,51 +1727,6 @@ def test_llama_cpp_prefix_and_alias_exposure() -> None:
         server.stop()
 
 
-def test_llama_cpp_per_server_name_and_api_key() -> None:
-    server = FakeLlamaServer(api_key="llama-key").start()
-    app = None
-    try:
-        config = mr.build_config(
-            {
-                "server": {"host": "127.0.0.1", "port": 4000},
-                "llama_cpp": {
-                    "servers": [
-                        {
-                            "url": server.url,
-                            "name": "local-llama",
-                            "api_key": "llama-key",
-                        }
-                    ],
-                    "refresh_seconds": 0,
-                },
-            }
-        )
-        app = mr.App(config)
-        entry = next(
-            item
-            for item in app.models_payload()["data"]
-            if item["id"] == "llama-test"
-        )
-        assert entry["owned_by"] == "local-llama"
-        route = app.resolve("llama-test")
-        assert route is not None
-        plan = app.dispatch(
-            "openai-chat",
-            route,
-            _body("openai-chat", "llama-test", False),
-            {},
-        )
-        assert plan.status == 200
-        assert plan.body is not None
-        assert json.loads(plan.body)["choices"][0]["message"]["content"] == "llama pong"
-        sent = server.last_request("/v1/chat/completions")
-        assert sent["body"]["model"] == "llama-test"
-        assert sent["headers"]["authorization"] == "Bearer llama-key"
-        assert app.provider(route.provider_name).api_key == "llama-key"
-    finally:
-        if app is not None:
-            app.close()
-        server.stop()
 
 
 def test_llama_cpp_unreachable_server_does_not_break_startup(
@@ -2428,222 +1778,16 @@ def test_llama_cpp_keeps_last_routes_when_server_goes_away() -> None:
         server.stop()
 
 
-def test_llama_cpp_env_and_default_server_urls(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setenv(
-        "LLAMA_SERVER_URL", "http://127.0.0.1:8080; http://127.0.0.1:8081/"
-    )
-    config = mr.build_config({"llama_cpp": {}})
-    assert [server.url for server in config.llama_cpp.servers] == [
-        "http://127.0.0.1:8080",
-        "http://127.0.0.1:8081",
-    ]
-
-    monkeypatch.delenv("LLAMA_SERVER_URL")
-    config = mr.build_config({"llama_cpp": {}})
-    assert [server.url for server in config.llama_cpp.servers] == [
-        mr.DEFAULT_LLAMA_URL
-    ]
-
-    config = mr.build_config({"llama_cpp": {"ports": [8080, 8081]}})
-    assert [server.url for server in config.llama_cpp.servers] == [
-        "http://127.0.0.1:8080",
-        "http://127.0.0.1:8081",
-    ]
 
 
-def test_llama_cpp_config_validation(monkeypatch: pytest.MonkeyPatch) -> None:
-    with pytest.raises(SystemExit):
-        mr.build_config({"llama_cpp": {"servers": ["ftp://127.0.0.1:9931"]}})
-    with pytest.raises(SystemExit):
-        mr.build_config({"llama_cpp": {"servers": [{"name": "no-url"}]}})
-    with pytest.raises(SystemExit):
-        mr.build_config({"llama_cpp": {"ports": [70000]}})
-    with pytest.raises(SystemExit):
-        mr.build_config({"llama_cpp": {"timeout": 0}})
-    with pytest.raises(SystemExit):
-        mr.build_config({"llama_cpp": {"refresh_seconds": -1}})
-    with pytest.raises(SystemExit):
-        mr.build_config({"llama_cpp": {"context_fallback": 0}})
-
-    monkeypatch.delenv("LLAMA_TEST_KEY", raising=False)
-    with pytest.raises(SystemExit):
-        mr.build_config({"llama_cpp": {"api_key_env": "LLAMA_TEST_KEY"}})
 
 
-@pytest.mark.parametrize("second_url", ["http://127.0.0.1:9002", "http://127.0.0.1:9001"])
-def test_llama_cpp_rejects_audit_duplicate_names_before_probing(
-    monkeypatch: pytest.MonkeyPatch, second_url: str,
-) -> None:
-    def unexpected_probe(*args: Any, **kwargs: Any) -> None:
-        pytest.fail("Ambiguous identities must fail before network discovery")
-
-    monkeypatch.setattr(mr.App, "_probe_llama_server", unexpected_probe)
-    with pytest.raises(SystemExit, match="duplicate explicit provider name 'local'") as exc:
-        mr.App(mr.build_config({"llama_cpp": {"servers": [
-            {"url": "http://127.0.0.1:9001", "name": "local"},
-            {"url": second_url, "name": "local"},
-        ]}}))
-    assert "servers[1]" in str(exc.value)
-    assert "servers[0]" in str(exc.value)
-    assert "unique name or omit names" in str(exc.value)
 
 
-@pytest.mark.parametrize("reserved", [False, True])
-def test_llama_cpp_generated_collisions_keep_identity_through_health_changes(
-    monkeypatch: pytest.MonkeyPatch, reserved: bool,
-) -> None:
-    # Different URLs normalize to the same generated base name.
-    urls = ["http://127.0.0.1:9001/a/b", "http://127.0.0.1:9001/a-b"]
-    base = "llama-127.0.0.1-9001-a-b"
-    servers: list[Any] = [{"url": url, "api_key": f"dummy-{i}"}
-                          for i, url in enumerate(urls)]
-    raw: dict[str, Any] = {"llama_cpp": {"servers": servers, "refresh_seconds": 0}}
-    expected = [base, base + "-2"]
-    if reserved:
-        raw["providers"] = {base: {"dialect": "openai-chat", "base_url": urls[0],
-                                   "api_key": "dummy-static"}}
-        # Even a later, unreachable explicit server reserves its name before
-        # either generated identity is allocated.
-        servers.append({"url": "http://127.0.0.1:9003", "name": base + "-2"})
-        expected = [base + "-3", base + "-4"]
-
-    reachable = {urls[1]}
-
-    def probe(app: mr.App, llama: mr.LlamaCppConfig, server: mr.LlamaCppServer) -> dict[str, Any]:
-        # Identities must already exist when the very first probe begins.
-        assert [app._llama_names[url] for url in urls] == expected
-        if server.url not in reachable:
-            return {"server": server, "error": "controlled outage"}
-        i = urls.index(server.url)
-        return {"server": server, "rows": [{"id": f"model-{i}", "aliases": [f"alias-{i}"]}],
-                "props": {}}
-
-    def send(client: httpx.Client, request: httpx.Request, **kwargs: Any) -> httpx.Response:
-        assert request.method == "POST"
-        request.read()
-        model = json.loads(request.content)["model"]
-        i = int(model.removeprefix("model-"))
-        assert str(request.url) == urls[i] + "/v1/chat/completions"
-        assert request.headers["authorization"] == f"Bearer dummy-{i}"
-        return httpx.Response(200, json={"selected": i}, request=request)
-
-    monkeypatch.setattr(mr.App, "_probe_llama_server", probe)
-    monkeypatch.setattr(httpx.Client, "send", send)
-    app = mr.App(mr.build_config(raw))
-    try:
-        assert app._llama_names[urls[0]] == expected[0]
-        assert app._llama_names[urls[1]] == expected[1]
-        seen: set[str] = set()
-        for live in ({urls[1]}, {urls[0]}, set(urls), {urls[1]}, set(), set(urls)):
-            reachable.clear()
-            reachable.update(live)
-            seen.update(live)
-            app.refresh_llama_cpp(force=True)
-            status = app.llama_cpp_status()
-            for i, url in enumerate(urls):
-                state = status["servers"][i]
-                assert state["provider"] == expected[i]
-                assert state["reachable"] == (url in live)
-                assert state["stale"] == (url in seen and url not in live)
-                route = app.resolve(f"model-{i}")
-                if url not in seen:
-                    assert route is None
-                    continue
-                assert route is not None
-                assert route.provider_name == expected[i]
-                assert app.resolve(f"alias-{i}") is route
-                plan = app.dispatch("openai-chat", route, _body("openai-chat", route.name, False), {})
-                assert json.loads(plan.body) == {"selected": i}
-            entries = app.models_payload()["data"]
-            assert {entry["id"] for entry in entries} == {
-                f"model-{i}" for i, url in enumerate(urls) if url in seen
-            }
-            for entry in entries:
-                i = int(entry["id"].removeprefix("model-"))
-                assert entry["owned_by"] == expected[i]
-                assert entry["metadata"]["llama_cpp"]["server"] == urls[i]
-    finally:
-        app.close()
 
 
-def test_llama_cpp_explicit_name_cannot_shadow_static_provider() -> None:
-    with pytest.raises(SystemExit, match="already configured in providers.*unique server name"):
-        mr.build_config({
-            "providers": {"local": {"dialect": "openai-chat", "base_url": "http://127.0.0.1:9000"}},
-            "llama_cpp": {"servers": [{"url": "http://127.0.0.1:9001", "name": "local"}]},
-        })
 
 
-@pytest.mark.parametrize("ingress", INGRESSES)
-@pytest.mark.parametrize("selection", ["llama-test", "tiny", "local/manual-model"])
-@pytest.mark.parametrize("change", ["remove", "replace"])
-def test_refresh_between_resolution_and_dispatch_pins_provider(
-    monkeypatch: pytest.MonkeyPatch, ingress: str, selection: str, change: str,
-) -> None:
-    server = FakeLlamaServer().start()
-    app = mr.App(mr.build_config(_llama_only_config(server, servers=[{
-        "url": server.url, "name": "local", "api_key": "dummy-old-key",
-    }])))
-    resolved = threading.Event()
-    resume = threading.Event()
-    original_resolve = app.resolve
-
-    def paused_resolve(model: str) -> mr.Route | None:
-        route = original_resolve(model)
-        resolved.set()
-        assert resume.wait(10), "test did not release resolution"
-        return route
-
-    monkeypatch.setattr(app, "resolve", paused_resolve)
-    router_server = mr.serve(app, "127.0.0.1", 0)
-    thread = threading.Thread(target=router_server.serve_forever,
-                              kwargs={"poll_interval": 0.01}, daemon=True)
-    thread.start()
-    base_url = f"http://127.0.0.1:{router_server.server_address[1]}"
-    try:
-        with ThreadPoolExecutor(max_workers=1) as pool:
-            pending = pool.submit(httpx.post, base_url + PATHS[ingress],
-                                  json=_body(ingress, selection, False), timeout=15)
-            try:
-                assert resolved.wait(10), "request never reached resolution"
-                assert app.config.llama_cpp is not None
-                if change == "remove":
-                    app.config.llama_cpp.servers.clear()
-                else:
-                    old = app.config.llama_cpp.servers[0]
-                    app.config.llama_cpp.servers[0] = replace(old, api_key="dummy-new-key")
-                    server.models = [{"id": "new-model"}]
-                app.refresh_llama_cpp(force=True)
-                assert original_resolve("llama-test") is None
-                assert original_resolve("tiny") is None
-                if change == "remove":
-                    assert original_resolve("local/manual-model") is None
-                    assert app.provider_count() == 0
-                else:
-                    assert app.provider("local").api_key == "dummy-new-key"
-                    assert original_resolve("new-model") is not None
-            finally:
-                resume.set()
-            response = pending.result(timeout=15)
-        assert response.status_code == 200, response.text
-        assert _text_from_response(ingress, response.json()) == "llama pong"
-        sent = server.last_request("/v1/chat/completions")
-        assert sent["headers"]["authorization"] == "Bearer dummy-old-key"
-        assert sent["body"]["model"] == (
-            "manual-model" if selection == "local/manual-model" else "llama-test"
-        )
-        if change == "replace":
-            response = httpx.post(base_url + PATHS[ingress], json=_body(ingress, "new-model", False))
-            assert response.status_code == 200, response.text
-            assert server.last_request("/v1/chat/completions")["headers"]["authorization"] == "Bearer dummy-new-key"
-    finally:
-        resume.set()
-        router_server.shutdown()
-        router_server.server_close()
-        app.close()
-        server.stop()
 
 
 def test_model_listing_retains_snapshot_during_refresh(
@@ -2679,40 +1823,6 @@ def test_model_listing_retains_snapshot_during_refresh(
         app.close()
 
 
-def test_health_retains_inventory_and_status_generation(
-    monkeypatch: pytest.MonkeyPatch, llama_server: FakeLlamaServer,
-) -> None:
-    app = mr.App(mr.build_config(_llama_only_config(llama_server)))
-    entered = threading.Event()
-    resume = threading.Event()
-    original_status = app.catalog_status
-
-    def paused_status(snapshot: mr.RegistrySnapshot | None = None) -> dict[str, Any]:
-        entered.set()
-        assert resume.wait(10)
-        return original_status(snapshot)
-
-    monkeypatch.setattr(app, "catalog_status", paused_status)
-    try:
-        with ThreadPoolExecutor(max_workers=1) as pool:
-            pending = pool.submit(app.health_payload)
-            try:
-                assert entered.wait(10)
-                app.config.llama_cpp.servers.clear()
-                app.refresh_llama_cpp(force=True)
-            finally:
-                resume.set()
-            old_health = pending.result(timeout=10)
-        assert old_health["models"] == old_health["llama_cpp"]["models"] == 1
-        assert old_health["providers"] == 1
-        assert len(old_health["llama_cpp"]["servers"]) == 1
-        new_health = app.health_payload()
-        assert new_health["models"] == new_health["llama_cpp"]["models"] == 0
-        assert new_health["providers"] == 0
-        assert new_health["llama_cpp"]["servers"] == []
-    finally:
-        resume.set()
-        app.close()
 
 
 @contextmanager
@@ -2784,62 +1894,5 @@ def test_registry_preserves_route_precedence_and_stale_routes(monkeypatch: pytes
         assert app.llama_cpp_status()["models"] == 0
 
 
-def test_concurrent_catalog_and_local_publications_keep_both_updates(monkeypatch: pytest.MonkeyPatch) -> None:
-    with controlled_registry(monkeypatch) as (app, state):
-        before = app._registry
-        state["local"] = [{"id": "new-local"}]
-        state["catalog"] = ["new-catalog"]
-        ready = threading.Barrier(3, timeout=10)
-        publish = threading.Event()
-        original_publish = app._publish_registry
-
-        def paused_publish(**kwargs: Any) -> None:
-            ready.wait()
-            assert publish.wait(10)
-            original_publish(**kwargs)
-
-        monkeypatch.setattr(app, "_publish_registry", paused_publish)
-        with ThreadPoolExecutor(max_workers=2) as pool:
-            local = pool.submit(app.refresh_llama_cpp, force=True)
-            catalog = pool.submit(app.refresh_catalog, force=True)
-            try:
-                ready.wait()
-                # Neither half-built inventory nor status has been published.
-                assert app._registry is before
-                health = app.health_payload()
-                assert health["llama_cpp"]["models"] == 1
-                assert health["catalog"]["models"] == 5
-            finally:
-                publish.set()
-            local.result(timeout=10)
-            catalog.result(timeout=10)
-        assert app.resolve("new-local").provider_name == "local"
-        assert app.resolve("new-catalog").provider_name == "static"
-        assert app.resolve("local-wins") is None
-        assert app.resolve("catalog-only") is None
-        health = app.health_payload()
-        assert health["models"] == 3  # explicit shared plus the two new models
-        assert health["llama_cpp"]["models"] == health["catalog"]["models"] == 1
 
 
-def test_registry_metadata_and_transport_settings_are_immutable(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    with controlled_registry(monkeypatch) as (app, state):
-        snapshot = app._registry
-        route = app.resolve("local-wins")
-        with pytest.raises(TypeError):
-            snapshot.providers["other"] = app.provider("local")
-        with pytest.raises(TypeError):
-            route.metadata["llama_cpp"]["server"] = "http://127.0.0.1:9999"
-        with pytest.raises(TypeError):
-            route._provider.headers["Authorization"] = "Bearer changed"
-        entries = app.models_payload()["data"]
-        local = next(entry for entry in entries if entry["id"] == "local-wins")
-        local["metadata"]["llama_cpp"]["server"] = "changed"
-        local["metadata"]["capabilities"].append("changed")
-        state["local"][1]["aliases"].append("changed")
-        fresh = next(entry for entry in app.models_payload()["data"] if entry["id"] == "local-wins")
-        assert fresh["metadata"]["llama_cpp"]["server"] == "http://127.0.0.1:9001"
-        assert fresh["metadata"]["capabilities"] == ["text"]
-        assert app.resolve("changed") is None

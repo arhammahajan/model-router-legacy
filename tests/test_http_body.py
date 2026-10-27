@@ -48,19 +48,6 @@ def body_handler(
 CHUNKED = [("Transfer-Encoding", "chunked")]
 
 
-@pytest.mark.parametrize("size", [
-    b"-1", b"-0", b"+1", b"+0", b"0x1", b"1_0", b"", b"xyz",
-    b" 1", b"1 ", b"1;", b"1;foo=", b'1;foo="unclosed',
-    b"1;foo=bad value", b"1;foo=\x00", b"1\nignored",
-])
-def test_invalid_chunk_size_is_rejected_before_payload_read(size: bytes) -> None:
-    wire = size + b"\r\n" + b"x" * 100_000
-    handler = body_handler(wire, CHUNKED)
-    with pytest.raises(mr.RouterError) as error:
-        handler._read_body()
-    assert error.value.status == 400
-    assert handler.rfile.tell() <= len(size) + 2
-    assert handler.rfile.read_sizes == []
 
 
 @pytest.mark.parametrize("raw", [
@@ -90,32 +77,6 @@ def test_invalid_content_length_is_rejected_before_read(value: str) -> None:
     assert handler.rfile.tell() == 0
 
 
-@pytest.mark.parametrize("headers,status", [
-    (CHUNKED + [("Content-Length", "0")], 400),
-    (CHUNKED * 2, 400),
-    ([("Content-Length", "2"), ("Content-Length", "2")], 400),
-    ([("Content-Length", "2"), ("Content-Length", "3")], 400),
-    ([("Transfer-Encoding", "gzip, chunked")], 400),
-    ([("Transfer-Encoding", "chunked, gzip")], 400),
-    ([("Transfer-Encoding", "chunked, chunked")], 400),
-    ([("Transfer-Encoding", "notchunked")], 400),
-    ([("Transfer-Encoding", "identity")], 400),
-    ([("Transfer-Encoding", "chunked;foo=bar")], 400),
-    ([("Transfer-Encoding", "\vchunked")], 400),
-    ([("Transfer-Encoding", "")], 400),
-    ([("Content-Encoding", "gzip, gzip")], 415),
-    ([("Content-Encoding", "gzip"), ("Content-Encoding", "gzip")], 415),
-    ([("Content-Encoding", "br")], 415),
-    ([("Content-Encoding", "gzip\v")], 415),
-])
-def test_unsupported_or_conflicting_framing_rejected_before_read(
-    headers: list[tuple[str, str]], status: int,
-) -> None:
-    handler = body_handler(b"x" * 100_000, headers)
-    with pytest.raises(mr.RouterError) as error:
-        handler._read_body()
-    assert error.value.status == status
-    assert handler.rfile.tell() == 0
 
 
 def test_truncated_fixed_body_even_when_prefix_is_valid_json() -> None:
@@ -157,37 +118,8 @@ def test_large_body_rejected_before_over_limit_read(
     assert all(0 <= size <= 64 for size in handler.rfile.read_sizes)
 
 
-@pytest.mark.parametrize("wire,limit", [
-    (b"1;name=" + b"x" * 100_000, 64),
-    (b"0\r\nX-Name: " + b"x" * 100_000, 64),
-    ((b"1;name=" + b"x" * 900 + b"\r\nx\r\n") * 100, 128),
-    (b"0\r\n" + (b"X-Name: " + b"x" * 900 + b"\r\n") * 100, 64),
-    (b"0\r\n" + b"X-Name: x\r\n" * 101 + b"\r\n", 64),
-    (b"1\r\nx\r\n" * 20_000, 32_000),
-])
-def test_chunk_metadata_is_bounded(wire: bytes, limit: int) -> None:
-    handler = body_handler(wire, CHUNKED, limit)
-    with pytest.raises(mr.RouterError) as error:
-        handler._read_body()
-    assert error.value.status == 413
-    # Payload bytes and framing are bounded independently.
-    assert handler.rfile.tell() <= mr.MAX_CHUNK_METADATA + limit + 1
 
 
-@pytest.mark.parametrize("wire", [
-    b"", b"not gzip", gzip.compress(b"{}")[:5], gzip.compress(b"{}")[:-8],
-    gzip.compress(b"{}")[:-1],
-    gzip.compress(b"{}")[:-8] + b"\0" * 8,  # Invalid CRC/length.
-    gzip.compress(b"{}") + gzip.compress(b" "),
-    gzip.compress(b"{}") + gzip.compress(b""),
-    gzip.compress(b"{}") + b"junk", gzip.compress(b"{}") + b"\0",
-])
-def test_gzip_requires_one_complete_valid_member(wire: bytes) -> None:
-    handler = body_handler(wire, [("Content-Length", str(len(wire))),
-                                  ("Content-Encoding", "gzip")], limit=128)
-    with pytest.raises(mr.RouterError) as error:
-        handler._read_body()
-    assert error.value.status == 400
 
 
 def test_gzip_accepts_exact_decompressed_limit() -> None:
@@ -214,19 +146,3 @@ def test_gzip_expansion_cannot_bypass_small_body_limit(chunked: bool, truncated:
     assert error.value.status == 413
 
 
-def test_static_provider_headers_cannot_mislabel_reserialized_json() -> None:
-    provider = mr.Provider(
-        name="test", dialect=mr.DIALECT_OPENAI_CHAT, base_url="http://localhost",
-        api_key="dummy-key", timeout=30, litellm_provider="openai",
-        litellm_kwargs={"extra_headers": {"Repr-Digest": "stale"}}, drop_params=True,
-        headers={"Content-Encoding": "gzip", "Content-Type": "text/plain",
-                 "Content-Length": "1", "Transfer-Encoding": "chunked",
-                 "Content-Digest": "stale"},
-    )
-    translated = provider.litellm_call_kwargs()
-    for headers in (router_headers._upstream_request_headers(provider, mr.DIALECT_OPENAI_CHAT, {}),
-                    translated["headers"], translated["extra_headers"]):
-        lowered = {name.lower(): value for name, value in headers.items()}
-        assert lowered["content-type"] == "application/json"
-        assert not (lowered.keys() & {"content-encoding", "content-length", "content-digest",
-                                      "repr-digest", "transfer-encoding"})

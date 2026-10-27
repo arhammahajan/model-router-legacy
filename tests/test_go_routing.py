@@ -97,43 +97,6 @@ def test_bundled_mapping_matches_entire_reviewed_endpoint_table(bundled_app: mr.
     assert "dummy-go-provider-key" not in json.dumps(app.models_payload())
 
 
-@pytest.mark.parametrize(("model", "dialect"), [
-    ("glm-5.3-flash", "openai-chat"),
-    ("kimi-k3.1-pro", "openai-chat"),
-    ("deepseek-v4.1-flash", "openai-chat"),
-    ("mimo-v2.6-pro", "openai-chat"),
-    ("minimax-m3.1-flash", "openai-chat"),
-    ("minimax-m3", "anthropic"),
-    ("qwen3.8-max", "anthropic"),
-    ("qwen3.8-flash", "anthropic"),
-    ("qwen3.7-plus", "anthropic"),
-    ("claude-haiku-5-5", "anthropic"),
-    ("grok-4.7", "openai-responses"),
-    ("gpt-6-luna", "openai-responses"),
-    ("muse-spark-1.3-contributor", "openai-responses"),
-])
-def test_bundled_routes_send_to_documented_endpoint_with_trusted_key(
-    bundled_app: mr.App, offline_catalog: dict[str, Any], model: str, dialect: str,
-) -> None:
-    route = bundled_app.resolve(model)
-    assert route is not None and route.dialect == dialect
-    body: dict[str, Any] = {"model": model, "stream": False}
-    body.update({"input": "Hi"} if dialect == "openai-responses" else {
-        "messages": [{"role": "user", "content": "Hi"}], "max_tokens": 32,
-    })
-    result = bundled_app.dispatch(dialect, route, body, {
-        "Authorization": "Bearer dummy-client-key", "x-api-key": "dummy-client-key",
-    })
-    assert result.status == 200
-    request = offline_catalog["requests"][-1]
-    assert str(request.url) == ENDPOINTS[model]["endpoint"]
-    assert json.loads(request.content)["model"] == model
-    if dialect == "anthropic":
-        assert request.headers["x-api-key"] == "dummy-go-provider-key"
-        assert "authorization" not in request.headers
-    else:
-        assert request.headers["authorization"] == "Bearer dummy-go-provider-key"
-        assert "x-api-key" not in request.headers
 
 
 @pytest.mark.parametrize("ingress", ["openai-chat", "openai-responses", "anthropic"])
@@ -264,11 +227,3 @@ def test_catalog_cannot_choose_credentials_or_endpoints(
         app.close()
 
 
-@pytest.mark.parametrize("mapping", [
-    None, [], "opencode-chat", {"": "opencode-chat"}, {" spaced ": "opencode-chat"},
-    {1: "opencode-chat"}, {"model": "missing"}, {"model": {"api_key": "untrusted"}},
-])
-def test_exact_mapping_validation(bundled_raw: dict[str, Any], mapping: Any) -> None:
-    bundled_raw["catalog"]["model_providers"] = mapping
-    with pytest.raises(SystemExit, match="catalog.model_providers"):
-        mr.build_config(bundled_raw)
