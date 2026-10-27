@@ -88,7 +88,8 @@ deadline = 600                  # total dispatch + upstream IO + backoff + strea
 #   "x-opencode-session". Client must reuse one ID per conversation.
 # session_source_headers: ordered subset of reviewed native conversation headers.
 #   Default: ["x-claude-code-session-id", "session-id", "session_id", "thread-id",
-#             "conversation_id", "x-session-id"]. [] disables native extraction.
+#             "conversation_id", "x-session-id", "x-mavis-session-id"].
+#   [] disables native extraction. MCode sends x-mavis-session-id per session.
 #   Explicit session_header always wins; native sources precede the body fallback.
 # session_prompt_cache_key = false: opt in to top-level prompt_cache_key fallback.
 #   Reuse it per conversation; translated calls consume it as affinity metadata,
@@ -170,6 +171,7 @@ api_key = "ollama"
 # http://127.0.0.1:9931.
 # ---------------------------------------------------------------------------
 # [llama_cpp]
+# compatibility = "strict"   # "lossy" permits diagnosed cross-protocol approximation
 # servers = ["http://127.0.0.1:9931"]
 # # Or scan fixed localhost ports:
 # # ports = [9931, 8080]

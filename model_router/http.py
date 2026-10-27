@@ -231,7 +231,8 @@ class Handler(BaseHTTPRequestHandler):
                 # identities. Never echo URL queries or an arbitrary model ID.
                 path = urlsplit(getattr(self, "path", "")).path.rstrip("/") or "/"
                 known = path in ENDPOINTS or path in {
-                    "/", "/models", "/v1/models", "/livez", "/readyz",
+                    "/", "/models", "/v1/models", "/muse-code/models",
+                    "/v1/muse-code/models", "/livez", "/readyz",
                     "/health", "/healthz", "/diagnostics",
                 }
                 self.app.log_event(
@@ -290,15 +291,15 @@ class Handler(BaseHTTPRequestHandler):
                     return self._send_error(DIALECT_OPENAI_CHAT, RouterError(401, "Invalid API key"))
                 return self._send_bytes(200, "application/json", {},
                                         _json_bytes(self.app.diagnostics_payload()))
-            if path in ("/v1/models", "/models"):
+            if path in ("/v1/models", "/models", "/muse-code/models", "/v1/muse-code/models"):
                 if not self.app.authorized(self.headers):
                     return self._send_error(
                         DIALECT_OPENAI_CHAT,
                         RouterError(401, "Invalid API key"),
                     )
-                return self._send_bytes(
-                    200, "application/json", {}, _json_bytes(self.app.models_payload())
-                )
+                payload = (self.app.muse_models_payload() if path.endswith("/muse-code/models")
+                           else self.app.models_payload())
+                return self._send_bytes(200, "application/json", {}, _json_bytes(payload))
             if path == "/":
                 return self._send_bytes(
                     200,

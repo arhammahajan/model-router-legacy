@@ -47,6 +47,7 @@ from .config import (
 from .constants import (
     DEFAULT_TIMEOUT,
     DIALECT_OPENAI_CHAT,
+    DIALECT_OPENAI_RESPONSES,
     DISCOVERY_CACHE_MAX_BYTES,
     DISCOVERY_CACHE_VERSION,
     LLAMA_LIMIT_FIELDS,
@@ -485,7 +486,8 @@ class DiscoveryRegistry:
             name=self._llama_names[server.url], dialect=DIALECT_OPENAI_CHAT,
             base_url=_llama_base_url(server.url), api_key=server.api_key,
             headers={**llama.headers, **server.headers}, timeout=DEFAULT_TIMEOUT,
-            litellm_provider="openai", litellm_kwargs={}, drop_params=False,
+            litellm_provider="openai", litellm_kwargs={},
+            drop_params=llama.compatibility == "lossy",
             llama_cpp=True,
         )
 
@@ -1358,6 +1360,28 @@ class DiscoveryRegistry:
 
     def models_payload(self) -> dict[str, Any]:
         return self._models_payload(self._registry)
+
+    def muse_models_payload(self) -> dict[str, Any]:
+        """Project the full cached inventory into Muse's Responses catalog."""
+        payload = self.models_payload()
+        data = payload["data"]
+        for entry in data:
+            metadata = entry["metadata"]
+            limits = metadata["router"]["limits"]
+            metadata["muse-code"] = {
+                "display_label": entry["display_name"],
+                "is_hidden": False,
+                "limit": {
+                    "context": limits["context_window"]["value"] or 128000,
+                    "output": limits["max_output_tokens"]["value"] or 16384,
+                },
+            }
+        return {
+            **payload,
+            "data": data,
+            "first_id": data[0]["id"] if data else None,
+            "last_id": data[-1]["id"] if data else None,
+        }
 
     def _models_payload(self, snapshot: RegistrySnapshot) -> dict[str, Any]:
         now = int(time.time())

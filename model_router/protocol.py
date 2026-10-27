@@ -12,6 +12,7 @@ from .config import Provider, Route
 from .constants import (
     _GENERATION_FIELDS,
     DIALECT_ANTHROPIC,
+    DIALECT_GEMINI,
     DIALECT_OPENAI_CHAT,
     DIALECT_OPENAI_RESPONSES,
 )
@@ -265,6 +266,32 @@ def _prepare_translation(
             for key in parts[:-1]:
                 node = node.get(key, {})
             node.pop(parts[-1], None)
+
+    if route.dialect == DIALECT_GEMINI:
+        # Anthropic cache hints make LiteLLM create Gemini cachedContents via
+        # additional API calls. The generation bridge does not expose that
+        # service (and gateways commonly do not implement it). Keep the prompt
+        # and tools intact, and diagnose the lost caching optimization.
+        cache_removed = False
+
+        def strip_cache(node: Any) -> None:
+            nonlocal cache_removed
+            if isinstance(node, list):
+                for item in node:
+                    strip_cache(item)
+            elif isinstance(node, dict):
+                if "cache_control" in node:
+                    node.pop("cache_control")
+                    cache_removed = True
+                # Only protocol content blocks; never traverse tool schemas or
+                # user-supplied tool arguments, which may name cache_control.
+                if "content" in node:
+                    strip_cache(node["content"])
+
+        for field in ("messages", "system", "tools"):
+            strip_cache(params.get(field))
+        if cache_removed:
+            lose("cache_control", "target cache service is outside the generation bridge")
 
     # These bridge fields have an explicit mapping in the installed adapters.
     # Native fields outside this set require their native endpoint.

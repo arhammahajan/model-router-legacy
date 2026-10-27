@@ -9,7 +9,8 @@ import pytest
 
 import model_router as mr
 from test_model_router import (
-    PATHS, TRANSLATED_ROUTES, _body, _config, _with_gemini, router_config, upstream,
+    PATHS, TRANSLATED_ROUTES, _body, _config, _llama_only_config, _with_gemini,
+    llama_server, router_config, upstream,
 )
 
 
@@ -31,6 +32,49 @@ def control(ingress: str, feature: str) -> dict[str, Any]:
             {"text": {"format": {"type": "json_schema", "name": "result", "schema": schema}}}
             if ingress == "openai-responses" else
             {"output_format": {"type": "json_schema", "schema": schema}})
+
+
+@pytest.mark.parametrize("ingress", ["anthropic", "openai-chat"])
+@pytest.mark.parametrize("lossy", [False, True])
+def test_gemini_cache_hints_never_create_an_extra_cache_service_request(upstream, ingress, lossy):
+    raw = _with_gemini(_config(upstream), upstream)
+    raw["providers"]["gem"]["compatibility"] = "lossy" if lossy else "strict"
+    body = _body(ingress, "m-gem", False)
+    cached = {"type": "text", "text": "Keep this prompt", "cache_control": {"type": "ephemeral"}}
+    if ingress == "anthropic":
+        body["system"] = [cached]
+    else:
+        body["messages"].insert(0, {"role": "system", "content": [cached]})
+    with router_config(raw) as base:
+        response = httpx.post(base + PATHS[ingress], json=body, timeout=30)
+    if lossy:
+        assert response.status_code == 200, response.text
+        assert "cache_control" in {loss["field"] for loss in json.loads(response.headers["x-model-router-loss"])}
+        assert len(upstream.requests) == 1
+        assert upstream.requests[0]["path"] == "/v1beta/models/gemini-2.5-flash:generateContent"
+        assert "Keep this prompt" in json.dumps(upstream.requests[0]["body"])
+    else:
+        assert response.status_code == 400
+        assert upstream.requests == []
+
+
+@pytest.mark.parametrize("lossy", [False, True])
+def test_discovered_local_models_use_the_configured_translation_policy(llama_server, lossy):
+    raw = _llama_only_config(llama_server, compatibility="lossy" if lossy else "strict")
+    with router_config(raw) as base:
+        response = httpx.post(base + "/v1/responses", json={
+            "model": "llama-test", "input": "hello", "max_output_tokens": 32,
+            "store": False, "include": ["reasoning.encrypted_content"],
+        }, timeout=30)
+    if lossy:
+        assert response.status_code == 200, response.text
+        assert {loss["field"] for loss in json.loads(response.headers["x-model-router-loss"])} == {"store", "include"}
+        sent = llama_server.last_request("/v1/chat/completions")["body"]
+        assert sent["model"] == "llama-test"
+        assert sent["messages"][0]["content"] == "hello"
+    else:
+        assert response.status_code == 400
+        assert not any(request["path"] == "/v1/chat/completions" for request in llama_server.requests)
 
 
 @pytest.mark.parametrize("ingress,model,path", TRANSLATED_ROUTES)

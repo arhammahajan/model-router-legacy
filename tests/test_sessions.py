@@ -36,6 +36,16 @@ def provider(**policy):
     })
 
 
+def test_mcode_native_session_identity_reaches_upstream(upstream):
+    with router_config(session_config(upstream)) as base:
+        for identity in ("mcode-session-a", "mcode-session-b", "mcode-session-a"):
+            response = httpx.post(base + "/v1/chat/completions", json={
+                "model": "m-chat", "messages": [{"role": "user", "content": "hello"}],
+            }, headers={"X-Mavis-Session-Id": identity}, timeout=30)
+            assert response.status_code == 200, response.text
+            request = upstream.last_request("/v1/chat/completions")
+            assert request["headers"]["x-opencode-session"] == identity
+            assert "x-mavis-session-id" not in request["headers"]
 
 
 @pytest.mark.parametrize("ingress", INGRESSES)

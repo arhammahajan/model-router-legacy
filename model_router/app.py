@@ -43,6 +43,7 @@ from .protocol import (
 )
 from .streams import Plan, StreamState, _chat_sse, _responses_sse, _translated_sse
 from .transport import _GenerationTransport, _RequestBudget
+from .tool_namespaces import flatten_namespaces, restore_namespaces
 
 
 class App(DiscoveryRegistry):
@@ -171,6 +172,9 @@ class App(DiscoveryRegistry):
             # Explicit affinity metadata is consumed before protocol validation.
             # Native passthrough keeps the provider's original cache field.
             payload = {key: value for key, value in payload.items() if key != "prompt_cache_key"}
+        tool_names = {}
+        if ingress == DIALECT_OPENAI_RESPONSES:
+            payload, tool_names = flatten_namespaces(payload)
         contract = self._route_entry(route if route._provider else replace(route, _provider=provider),
                                      int(time.time()), self._registry)["metadata"]["router"]
         params, losses = _prepare_translation(provider, route, ingress, payload, contract)
@@ -184,7 +188,7 @@ class App(DiscoveryRegistry):
             if ingress == DIALECT_OPENAI_CHAT:
                 plan = self._from_openai_chat(provider, route, params, session_id)
             elif ingress == DIALECT_OPENAI_RESPONSES:
-                plan = self._from_openai_responses(provider, route, params, session_id)
+                plan = self._from_openai_responses(provider, route, params, session_id, tool_names)
             else:
                 plan = self._from_anthropic(provider, route, params, session_id)
         except adapter.unsupported_params_error as exc:
@@ -306,6 +310,7 @@ class App(DiscoveryRegistry):
         route: Route,
         payload: dict[str, Any],
         session_id: str | None = None,
+        tool_names: dict[str, tuple[str, str]] | None = None,
     ) -> Plan:
         params = _clean_request_params(payload, DIALECT_OPENAI_RESPONSES)
         stream = bool(params.get("stream"))
@@ -318,14 +323,17 @@ class App(DiscoveryRegistry):
             call_kwargs["use_chat_completions_api"] = True
         result = adapter.responses(**call_kwargs)
 
+        def restore(value: Any) -> Any:
+            return restore_namespaces(_jsonable(value), tool_names or {})
+
         if stream:
             state = StreamState()
             return Plan(
                 content_type="text/event-stream",
-                chunks=_responses_sse(result, self.sanitize, state),
+                chunks=_responses_sse((restore(event) for event in result), self.sanitize, state),
                 resources=(result,), stream_state=state,
             )
-        return Plan(body=_json_bytes(_sanitize_generated_errors(_jsonable(result), self.sanitize)))
+        return Plan(body=_json_bytes(_sanitize_generated_errors(restore(result), self.sanitize)))
 
     def _from_anthropic(
         self,

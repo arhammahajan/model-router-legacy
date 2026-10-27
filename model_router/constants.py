@@ -107,7 +107,7 @@ _DROP_REQUEST_HEADERS = _HOP_BY_HOP | {
 # Sources and review date are recorded in README's conversation affinity policy.
 _NATIVE_SESSION_HEADERS = (
     "x-claude-code-session-id", "session-id", "session_id", "thread-id",
-    "conversation_id", "x-session-id",
+    "conversation_id", "x-session-id", "x-mavis-session-id",
 )
 _SESSION_VALUE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}\Z")
 # Response bodies are decoded by httpx, so encoding/length headers no longer

@@ -73,6 +73,7 @@ headers = { "User-Agent" = "litellm-model-router/0.3.0" }
 "beam-free" = "opencode-chat"
 
 [providers.opencode-chat]
+compatibility = "lossy" # All harness protocols; report approximated/dropped controls.
 dialect = "openai-chat"
 base_url = "https://opencode.ai/inference/go/openai/v1"
 api_key_env = "OPENCODE_API_KEY"
@@ -83,6 +84,7 @@ headers = { "User-Agent" = "litellm-model-router/0.3.0" }
 timeout = 600
 
 [providers.opencode-openai]
+compatibility = "lossy"
 dialect = "openai-responses"
 base_url = "https://opencode.ai/inference/go/openai/v1"
 api_key_env = "OPENCODE_API_KEY"
@@ -93,6 +95,7 @@ headers = { "User-Agent" = "litellm-model-router/0.3.0" }
 timeout = 600
 
 [providers.opencode-anthropic]
+compatibility = "lossy"
 dialect = "anthropic"
 base_url = "https://opencode.ai/inference/go/anthropic"
 api_key_env = "OPENCODE_API_KEY"
@@ -104,6 +107,7 @@ headers = { "User-Agent" = "litellm-model-router/0.3.0" }
 timeout = 600
 
 [providers.opencode-gemini]
+compatibility = "lossy"
 dialect = "gemini"
 base_url = "https://opencode.ai/inference/go/google/v1beta"
 api_key_env = "OPENCODE_API_KEY"
@@ -119,6 +123,7 @@ timeout = 600
 # and aliases. LLAMA_SERVER_URL overrides the server list. Delete this section
 # to turn discovery off.
 [llama_cpp]
+compatibility = "lossy"
 servers = ["http://127.0.0.1:9931"]
 refresh_seconds = 30
 timeout = 1

@@ -53,9 +53,25 @@ client.messages.create(model="glm-5.3", max_tokens=256, messages=[{"role": "user
 | `POST /v1/responses` | OpenAI Responses ingress |
 | `POST /v1/messages` | Anthropic Messages ingress |
 | `GET /v1/models` | Model list with capability and limit metadata |
+| `GET /v1/muse-code/models` (also `/muse-code/models`) | Muse-compatible full model catalog and limits |
 | `GET /livez` | Liveness |
 | `GET /readyz` | Readiness (503 until a usable route exists) |
 | `GET /diagnostics` | Providers and discovery status; needs router auth |
+
+### Conversation affinity
+
+Providers with `session_header` use an explicit upstream session header first,
+then these client-owned headers in order: `x-claude-code-session-id`, `session-id`,
+`session_id`, `thread-id`, `conversation_id`, `x-session-id`, and
+`x-mavis-session-id`. A configured `session_source_headers` list can narrow or
+reorder that set. `session_prompt_cache_key = true` enables a final body fallback.
+No identity is derived from credentials or prompt text.
+
+The MCode header was verified on 2026-10-27 against installed MCode 0.6.13's
+`LocalModelResolver`: it sets `X-Mavis-Session-Id` from the durable session ID
+for custom providers. Pi's integration sends its durable session ID as
+`x-session-id`. These identities are consumed and remapped to the configured
+upstream header rather than forwarded as unrelated request headers.
 
 ## Configuration
 
@@ -111,6 +127,20 @@ A client-supplied `thinking_budget_tokens` or `enable_thinking` always wins. Thi
 ## Harness integrations
 
 [`integrations/`](integrations) holds client-side adapters that point a coding harness at the router. Currently there is a pi extension; see [docs/integrations.md](docs/integrations.md).
+
+Muse connects directly to `http://127.0.0.1:4000/v1` and needs no adapter. The
+router serves a Muse-compatible catalog at `/muse-code/models` and
+`/v1/muse-code/models` from the same authenticated, cached inventory as
+`/v1/models`, and generation uses the existing `/v1/responses` endpoint.
+
+The bundled `router.toml` opts its providers and discovered llama.cpp servers into
+`compatibility = "lossy"` so harnesses can use every model. Nonportable controls
+are dropped or approximated with `x-model-router-loss` diagnostics; native calls
+pass through unchanged. Custom configurations still default to strict translation.
+Model visibility does not guarantee every upstream-native feature exists in all
+protocols: stored Responses state and provider-native built-in tools remain
+protocol-specific. Ordinary function tools translate across the protocols,
+including Responses function namespaces.
 
 ## Development
 

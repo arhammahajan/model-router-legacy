@@ -310,6 +310,7 @@ class LlamaCppConfig:
     prefix: str
     expose_aliases: bool
     limit_overrides: Mapping[str, Mapping[str, int | None]] = field(default_factory=dict)
+    compatibility: str = "strict"
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "limit_overrides", _freeze(self.limit_overrides))
@@ -619,8 +620,11 @@ def _build_llama_cpp(raw: Mapping[str, Any]) -> LlamaCppConfig:
         **_CREDENTIAL_FIELDS, "headers": (dict,), "servers": (list, str, dict),
         "ports": (list, int), "timeout": (int, float), "refresh_seconds": (int, float),
         "context_fallback": (int,), "limit_overrides": (dict,), "prefix": (str,),
-        "aliases": (bool,),
+        "aliases": (bool,), "compatibility": (str,),
     }, where)
+    compatibility = raw.get("compatibility", "strict")
+    if compatibility not in ("strict", "lossy"):
+        raise SystemExit(f"{where}: 'compatibility' must be 'strict' or 'lossy'")
     _config_headers(raw.get("headers", {}), f"{where}.headers")
     _config_number(raw.get("timeout", DEFAULT_LLAMA_PROBE_TIMEOUT), f"{where}.timeout")
     _config_number(raw.get("refresh_seconds", DEFAULT_LLAMA_REFRESH),
@@ -777,6 +781,7 @@ def _build_llama_cpp(raw: Mapping[str, Any]) -> LlamaCppConfig:
         prefix=prefix,
         expose_aliases=bool(raw.get("aliases", True)),
         limit_overrides=limit_overrides,
+        compatibility=compatibility,
     )
 
 

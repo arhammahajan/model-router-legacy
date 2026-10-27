@@ -69,6 +69,14 @@ async function discover(signal?: AbortSignal): Promise<any[]> {
 }
 
 export default async function (pi: ExtensionAPI) {
+  // Pi's Chat adapter does not send a conversation header by default. Reuse
+  // the durable Pi session ID so the router can provide upstream affinity.
+  pi.on("before_provider_headers", (event, ctx) => {
+    if (ctx.model?.provider === PROVIDER) {
+      event.headers["x-session-id"] = ctx.sessionManager.getSessionId();
+    }
+  });
+
   let models: any[] = [];
   try {
     models = await discover();
