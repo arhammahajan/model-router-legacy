@@ -160,11 +160,13 @@ class RouterHTTPServer(ThreadingHTTPServer):
             self._connections.clear()
             self._generations.clear()
         for connection in connections:
+            # Only shut down; the owning handler thread closes the socket. Closing
+            # here too races a blocked send/recv on some platforms (macOS), leaving
+            # it unwoken until its timeout.
             try:
                 connection.shutdown(socket.SHUT_RDWR)
             except OSError:
                 pass
-            connection.close()
 
     def shutdown(self) -> None:
         self._stop_connections()
