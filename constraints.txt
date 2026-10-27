@@ -1,6 +1,6 @@
 # Tested release dependency set, CPython 3.10–3.14 on Linux.
 # Includes runtime, test, build and check tools. Not a requirements file.
-# Retains the audited adapter/HTTP/SDK versions; see CONTRIBUTING.md to upgrade.
+# Retains the audited adapter/HTTP/SDK versions; see docs/contributing.md to upgrade.
 # Python 3.10 has marker-specific compatibility pins.
 aiohappyeyeballs==2.7.1
 aiohttp==3.14.5

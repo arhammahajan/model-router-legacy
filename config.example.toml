@@ -201,7 +201,7 @@ api_key = "ollama"
 # redeclaring its routing. Keys are canonical public IDs, INCLUDING any prefix.
 # Omit unknown fields; JSON configs can use null to withdraw a claim.
 # These are operator assertions for your verified build/template; no default
-# reasoning enum is assumed. See CAPABILITIES.md for schema and client usage.
+# reasoning enum is assumed. See docs/capabilities.md for schema and client usage.
 # [capabilities.overrides."llama/my-model-id".reasoning]
 # supported = true
 # [capabilities.overrides."llama/my-model-id".reasoning.effort]

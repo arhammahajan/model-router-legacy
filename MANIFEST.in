@@ -1,4 +1,4 @@
-include CONTRIBUTING.md CAPABILITIES.md
+recursive-include docs *.md
 include requirements.txt constraints.txt
 include router.toml config.example.toml
 include model_router.py

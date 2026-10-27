@@ -26,7 +26,7 @@ def _require_litellm_version() -> str:
             f"Incompatible LiteLLM version: {installed}; this router requires "
             f"litellm=={TESTED_LITELLM_VERSION} for its internal translation adapters. "
             f'Restore with: python -m pip install -c constraints.txt "litellm[mcp]=={TESTED_LITELLM_VERSION}". '
-            "Contributors: see CONTRIBUTING.md before testing a dependency upgrade."
+            "Contributors: see docs/contributing.md before testing a dependency upgrade."
         )
     return installed
 
@@ -73,7 +73,7 @@ except (ImportError, AttributeError, TypeError) as exc:
         f"LiteLLM {TESTED_LITELLM_VERSION} adapter initialization failed "
         f"({type(exc).__name__}); the installation is incomplete or incompatible. "
         f'Restore with: python -m pip install -c constraints.txt --force-reinstall "litellm[mcp]=={TESTED_LITELLM_VERSION}". '
-        "Use constraints.txt for the tested transitive dependencies; see CONTRIBUTING.md."
+        "Use constraints.txt for the tested transitive dependencies; see docs/contributing.md."
     ) from exc
 
 

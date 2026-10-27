@@ -106,11 +106,11 @@ A client-supplied `thinking_budget_tokens` or `enable_thinking` always wins. Thi
 
 ## Model capabilities
 
-`/v1/models` includes `metadata.router`: reasoning and effort levels, input and output modalities, tools, structured output, sampling controls, limits, and where each fact came from. `false` means unsupported and `null` means unknown. See [CAPABILITIES.md](CAPABILITIES.md).
+`/v1/models` includes `metadata.router`: reasoning and effort levels, input and output modalities, tools, structured output, sampling controls, limits, and where each fact came from. `false` means unsupported and `null` means unknown. See [docs/capabilities.md](docs/capabilities.md).
 
 ## Harness integrations
 
-[`integrations/`](integrations) holds client-side adapters that point a coding harness at the router. Currently there is a [pi extension](integrations/pi) that discovers models from `/v1/models`.
+[`integrations/`](integrations) holds client-side adapters that point a coding harness at the router. Currently there is a pi extension; see [docs/integrations.md](docs/integrations.md).
 
 ## Development
 
@@ -118,4 +118,4 @@ A client-supplied `thinking_budget_tokens` or `enable_thinking` always wins. Thi
 .venv/bin/python -m pytest
 ```
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for CI, dependency pins and upgrade testing. The code is in `model_router/`, with capability metadata in `router_metadata/`.
+See [docs/contributing.md](docs/contributing.md) for CI, dependency pins and upgrade testing. The code is in `model_router/`, with capability metadata in `router_metadata/`.
