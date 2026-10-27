@@ -33,8 +33,13 @@ def flatten_namespaces(payload: dict[str, Any]) -> tuple[dict[str, Any], dict[st
         if not isinstance(children, list):
             raise RouterError(400, "A tool namespace must contain a function tools array")
         for child in children:
-            if not isinstance(child, dict) or child.get("type") != "function":
-                raise RouterError(400, "Only function tools can be translated from a namespace")
+            if not isinstance(child, dict):
+                raise RouterError(400, "A tool namespace must contain tool objects")
+            if child.get("type") != "function":
+                # Not a function: surface it as an ordinary tool so the translation
+                # policy accepts or rejects it individually.
+                tools.append(child)
+                continue
             tools.append({**child, "name": alias(tool.get("name"), child.get("name"))})
     if "tools" in payload:
         payload["tools"] = tools
