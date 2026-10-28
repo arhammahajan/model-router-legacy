@@ -12,8 +12,9 @@ import uuid
 import zlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import TYPE_CHECKING, Any, Mapping
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
+from . import gemini
 from .common import (
     RouterError,
     _error_payload,
@@ -26,6 +27,9 @@ from .constants import (
     _CHUNK_LINE,
     _DROP_REQUEST_HEADERS,
     _TRAILER_LINE,
+    COUNT_TOKENS_ENDPOINTS,
+    DIALECT_ANTHROPIC,
+    DIALECT_GEMINI,
     DIALECT_OPENAI_CHAT,
     ENDPOINTS,
     MAX_CHUNK_LINE,
@@ -230,7 +234,7 @@ class Handler(BaseHTTPRequestHandler):
                 # Log only recognized paths and resolved, server-owned route
                 # identities. Never echo URL queries or an arbitrary model ID.
                 path = urlsplit(getattr(self, "path", "")).path.rstrip("/") or "/"
-                known = path in ENDPOINTS or path in {
+                known = path in ENDPOINTS or path in COUNT_TOKENS_ENDPOINTS or path in {
                     "/", "/models", "/v1/models", "/muse-code/models",
                     "/v1/muse-code/models", "/livez", "/readyz",
                     "/health", "/healthz", "/diagnostics",
@@ -238,7 +242,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.app.log_event(
                     event="request_outcome", request_id=self._request_id,
                     method=self.command if self.command in {"GET", "POST"} else "other",
-                    path=path if known else "unknown", http_status=self._http_status,
+                    path=path if known else gemini.log_label(self.command, path) or "unknown",
+                    http_status=self._http_status,
                     stream=self._streamed_request, stream_outcome=self._stream_outcome,
                     elapsed_ms=round((time.monotonic() - started) * 1000, 3),
                     **self._selection,
@@ -268,9 +273,48 @@ class Handler(BaseHTTPRequestHandler):
 
     # -- entry points ----------------------------------------------------
 
+    def _query(self) -> dict[str, list[str]]:
+        try:
+            return parse_qs(urlsplit(self.path).query, keep_blank_values=True, max_num_fields=50)
+        except ValueError:
+            raise RouterError(400, "Too many query parameters", code="invalid_request") from None
+
+    def _gemini_get(self, path: str) -> bool:
+        """models.list / models.get on the Gemini discovery paths; False if not one."""
+        target: gemini.GeminiPath | None = None
+        if not gemini.is_list_path(path):
+            if not path.startswith("/v1beta/"):
+                return False
+            target = gemini.parse_model_path(path)
+            if target is None:
+                return False
+        query = self._query()
+        if not self.app.authorized(self.headers, query.get("key", [])):
+            self._send_error(DIALECT_GEMINI, RouterError(401, "Invalid API key"))
+            return True
+        page: dict[str, Any] | None
+        if target is None:
+            sizes, tokens = query.get("pageSize", []), query.get("pageToken", [])
+            page = self.app.gemini_models_payload(sizes[-1] if sizes else None,
+                                                  tokens[-1] if tokens else None)
+        else:
+            page = (self.app.gemini_model_payload(target.name)
+                    if target.kind == "models" else None)
+            if page is None:
+                raise RouterError(404, f"{target.kind}/{target.name} is not found for API version "
+                                       "v1beta. Call ListModels to see the list of available models.",
+                                  code="model_not_found")
+        self._send_bytes(200, "application/json", {}, _json_bytes(page))
+        return True
+
     def do_GET(self) -> None:  # noqa: N802 (http.server API)
         path = urlsplit(self.path).path.rstrip("/") or "/"
         try:
+            try:
+                if self._gemini_get(path):
+                    return
+            except RouterError as exc:
+                return self._send_error(DIALECT_GEMINI, exc)
             if path in ("/livez", "/health", "/healthz"):
                 return self._send_bytes(
                     200,
@@ -322,21 +366,33 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:  # noqa: N802 (http.server API)
         path = urlsplit(self.path).path
-        ingress = ENDPOINTS.get(path)
+        counting = path in COUNT_TOKENS_ENDPOINTS
+        call = gemini.parse_method_path(path)
+        # Counting speaks the Anthropic protocol, including its error shape.
+        ingress = (DIALECT_GEMINI if call is not None
+                   else DIALECT_ANTHROPIC if counting else ENDPOINTS.get(path))
         if ingress is None:
             return self._send_error(
                 DIALECT_OPENAI_CHAT, RouterError(404, f"Unknown route: {path}")
             )
+        try:
+            query = self._query() if call is not None else {}
+        except RouterError as exc:
+            return self._send_error(ingress, exc)
 
-        if not self.app.authorized(self.headers):
+        if not self.app.authorized(self.headers, query.get("key", [])):
             return self._send_error(
                 ingress,
                 RouterError(401, "Invalid API key"),
             )
+        self._gemini_array = False
 
         self._streamed_request = False
         generation_acquired = False
+        alt = None
         try:
+            if call is not None:
+                alt = self._gemini_call(call, query)
             self._reader.deadline = time.monotonic() + self.app.config.body_read_timeout
             try:
                 raw = self._read_body()
@@ -355,25 +411,42 @@ class Handler(BaseHTTPRequestHandler):
             if not isinstance(payload, dict):
                 raise RouterError(400, "Request body must be a JSON object")
 
+            if call is not None:
+                # The model and streaming mode belong to the URL. A body that also
+                # names them could disagree with it, so it is rejected, not merged.
+                for field in ("model", "stream"):
+                    if field in payload:
+                        raise RouterError(
+                            400, f"Invalid JSON payload received. Unknown name \"{field}\": "
+                                 "Cannot find field.", code="invalid_request")
+                payload = {**payload, "model": call.name,
+                           "stream": gemini.GENERATION_METHODS[call.method]}
+                self._gemini_array = payload["stream"] and alt != "sse"
             model = payload.get("model")
             if not isinstance(model, str) or not model.strip():
                 raise RouterError(
                     400, "A model ID is required", code="model_required"
                 )
             self._validate(ingress, payload)
-            self._streamed_request = payload.get("stream", False)
+            self._streamed_request = False if counting else payload.get("stream", False)
             # No waiting queue and no discovery lock is held during admission.
             # Include route resolution so discovery cannot accumulate an
-            # unbounded set of generation callers either.
-            generation_acquired = self.server.acquire_generation(self.connection)
-            if not generation_acquired:
-                raise RouterError(503, "Generation capacity exhausted",
-                                  code="generation_overloaded")
+            # unbounded set of generation callers either. Counting is not a
+            # generation: it is bounded by max_connections, body/read limits and
+            # the shared upstream deadline, and cannot exhaust generation slots.
+            if not counting:
+                generation_acquired = self.server.acquire_generation(self.connection)
+                if not generation_acquired:
+                    raise RouterError(503, "Generation capacity exhausted",
+                                      code="generation_overloaded")
             route = self.app.resolve(model)
             if route is None:
                 raise RouterError(
                     404,
-                    f"Model {model!r} is not configured",
+                    f"models/{model} is not found for API version v1beta, or is not "
+                    f"supported for {call.method}. Call ListModels to see the list of "
+                    "available models and their supported methods."
+                    if call is not None else f"Model {model!r} is not configured",
                     code="model_not_found",
                 )
             self._selection = {
@@ -382,12 +455,19 @@ class Handler(BaseHTTPRequestHandler):
                 "translation_mode": "passthrough" if ingress == route.dialect else "translated",
                 "ingress": ingress, "egress": route.dialect,
             }
+            if counting:
+                # Counting is never translated: a non-Anthropic route is refused.
+                self._selection.update(operation="count_tokens", translation_mode=None)
             # Dynamic upstream model names are client-supplied; omit them from
             # logs. Keep this provenance on the resolved route across refreshes.
             if route._dynamic:
                 self._selection.update(model=None, upstream_model=None)
 
-            plan = self.app.dispatch(ingress, route, payload, self.headers)
+            plan = (self.app.dispatch(ingress, route, payload, self.headers, count_tokens=True)
+                    if counting else
+                    self.app.dispatch(ingress, route, payload, self.headers, alt=alt)
+                    if call is not None else
+                    self.app.dispatch(ingress, route, payload, self.headers))
             self._send_plan(plan, ingress)
         except (BrokenPipeError, ConnectionResetError, _ClientWriteTimeout):
             self._stream_outcome = "disconnected" if self._streamed_request else "none"
@@ -405,6 +485,25 @@ class Handler(BaseHTTPRequestHandler):
 
     def _validate(self, ingress: str, payload: Mapping[str, Any]) -> None:
         _validate_ingress(ingress, payload)
+
+    def _gemini_call(self, call: gemini.GeminiPath, query: Mapping[str, list[str]]) -> str | None:
+        """Reject Gemini calls the router does not implement; return the validated alt."""
+        if call.kind != "models":
+            raise RouterError(404, f"{call.kind}/{call.name} is not supported by this router; "
+                                   "only models listed by ListModels are available.",
+                              code="model_not_found")
+        if call.method not in gemini.GENERATION_METHODS \
+                and call.method not in gemini.KNOWN_UNSUPPORTED_METHODS:
+            raise RouterError(404, f"Unknown route: /{call.kind}/*:{call.method[:40]}",
+                              code="unknown_route")
+        if call.method not in gemini.GENERATION_METHODS:
+            raise RouterError(501, f"Method {call.method} is not implemented by this router; "
+                                   "generateContent and streamGenerateContent are.",
+                              code="unimplemented_method")
+        alts = query.get("alt", [])
+        if len(alts) > 1 or (alts and alts[0] not in ("sse", "json")):
+            raise RouterError(400, "'alt' must be 'sse' or 'json'", code="invalid_request")
+        return alts[0] if alts else None
 
     def _read_body(self) -> bytes:
         max_bytes = self.app.config.max_body_bytes
@@ -615,7 +714,8 @@ class Handler(BaseHTTPRequestHandler):
         self._stream_outcome = "failed"
         try:
             self.wfile.write(_stream_error_bytes(
-                ingress, exc, self.app.sanitize, getattr(self, "_stream_state", None)))
+                ingress, exc, self.app.sanitize, getattr(self, "_stream_state", None),
+                array=getattr(self, "_gemini_array", False)))
             self.wfile.flush()
             if ingress == DIALECT_OPENAI_CHAT:
                 self.wfile.write(b"data: [DONE]\n\n")

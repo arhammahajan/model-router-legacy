@@ -1,8 +1,10 @@
 """Credential, session and representation-header policy shared by transports."""
 from __future__ import annotations
 
+import re
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any, Mapping
+from urllib.parse import quote
 
 from .common import RouterError
 from .constants import (
@@ -117,10 +119,35 @@ def _upstream_url(provider: Provider, ingress: str) -> str:
             return base
         return base + "/responses"
     if ingress == DIALECT_GEMINI:
-        if base.endswith("/v1beta"):
+        if base.endswith(("/v1beta", "/v1")):
             return base
         return base + "/v1beta"
     raise RouterError(500, f"Unknown dialect {ingress!r}")
+
+
+def _gemini_url(provider: Provider, upstream_model: str, method: str, alt: str | None) -> str:
+    """The upstream generateContent URL for a resolved model.
+
+    The model is client-influenced on dynamic ``provider/model`` routes and is
+    placed in the URL path, so it must not be able to change the path structure,
+    add a query or reach another resource. The SDKs reject the same characters.
+    """
+    name = upstream_model if upstream_model.startswith(("models/", "tunedModels/")) \
+        else "models/" + upstream_model
+    segments = name.split("/")
+    if (re.search(r"[\x00-\x20\x7f?#%&\\]", name) or any(s in ("", ".", "..") for s in segments)
+            or len(segments) < 2):
+        raise RouterError(400, "The upstream model name cannot be used in a Gemini request path",
+                          code="invalid_model")
+    url = f"{_upstream_url(provider, DIALECT_GEMINI)}/{quote(name, safe='/:')}:{method}"
+    # Only the response-format selector is forwarded; never `key` or anything else.
+    return url + "?alt=sse" if alt == "sse" else url
+
+
+def _count_tokens_url(provider: Provider) -> str:
+    """Anthropic's token-count endpoint, accepting the same base forms as messages."""
+    messages = _upstream_url(provider, DIALECT_ANTHROPIC)
+    return messages + "/count_tokens"
 
 
 def _set_header(headers: dict[str, str], name: str, value: str) -> None:

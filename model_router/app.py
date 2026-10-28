@@ -10,6 +10,7 @@ from typing import Any, AsyncIterator, Iterator, Mapping
 
 import httpx
 
+from . import gemini
 from .adapters import adapter
 from .common import (
     RouterError,
@@ -21,6 +22,7 @@ from .common import (
     _thaw,
 )
 from .config import Provider, Route
+from .count_tokens import count_tokens as _count_tokens
 from .constants import (
     DIALECT_ANTHROPIC,
     DIALECT_GEMINI,
@@ -30,6 +32,7 @@ from .constants import (
 from .discovery import DiscoveryRegistry
 from .headers import (
     _filtered_response_headers,
+    _gemini_url,
     _session_id,
     _translation_header_provider,
     _upstream_request_headers,
@@ -37,6 +40,7 @@ from .headers import (
 )
 from .protocol import (
     _clean_request_params,
+    _prepare_gemini_translation,
     _prepare_translation,
     _validate_ingress,
     _validated_generation_extensions,
@@ -44,6 +48,26 @@ from .protocol import (
 from .streams import Plan, StreamState, _chat_sse, _responses_sse, _translated_sse
 from .transport import _GenerationTransport, _RequestBudget
 from .tool_namespaces import flatten_namespaces, restore_namespaces
+
+
+def _upstream_error(status: int, data: bytes, ingress: str) -> RouterError:
+    """The untrusted upstream error body as a RouterError.
+
+    A Gemini ingress keeps an upstream google.rpc message and status name when the
+    body has them; everything is sanitized again when the response is rendered.
+    """
+    text = data.decode("utf-8", errors="replace") or f"Upstream returned HTTP {status}"
+    if ingress != DIALECT_GEMINI:
+        return RouterError(status, text)
+    try:
+        error = json.loads(data).get("error")
+    except (ValueError, AttributeError):
+        error = None
+    if isinstance(error, dict) and isinstance(error.get("message"), str) and error["message"]:
+        status_name = error.get("status")
+        return RouterError(status, error["message"],
+                           error_type=status_name if isinstance(status_name, str) else None)
+    return RouterError(status, text)
 
 
 class App(DiscoveryRegistry):
@@ -55,8 +79,13 @@ class App(DiscoveryRegistry):
         route: Route,
         payload: dict[str, Any],
         inbound_headers: Mapping[str, str],
+        *,
+        count_tokens: bool = False,
+        alt: str | None = None,
     ) -> Plan:
-        budget = _RequestBudget(self)
+        # A token count shares the generation transport's deadline, retry policy
+        # and proxy/redirect rules but never reaches a generation path.
+        budget = _RequestBudget(self, counting=count_tokens)
         provider = route._provider or self.provider(route.provider_name)
         transport = _GenerationTransport(budget, provider)
         # Each generation owns its pool. The inner transport selects environment
@@ -65,7 +94,11 @@ class App(DiscoveryRegistry):
                               timeout=provider.timeout)
         plan = None
         try:
-            plan = self._dispatch(ingress, route, payload, inbound_headers, client)
+            if count_tokens:
+                plan = _count_tokens(route, provider, payload, inbound_headers, client,
+                                     self.sanitize)
+            else:
+                plan = self._dispatch(ingress, route, payload, inbound_headers, client, alt)
             budget.timeout()
         except BaseException as exc:
             if plan is not None:
@@ -151,13 +184,14 @@ class App(DiscoveryRegistry):
     def _dispatch(
         self, ingress: str, route: Route, payload: dict[str, Any],
         inbound_headers: Mapping[str, str], client: httpx.Client,
+        alt: str | None = None,
     ) -> Plan:
         _validate_ingress(ingress, payload, translated=ingress != route.dialect)
         provider = route._provider or self.provider(route.provider_name)
         session_id = _session_id(provider, payload, inbound_headers)
         if ingress == route.dialect:
             return self._passthrough(
-                ingress, provider, route, payload, inbound_headers, session_id, client
+                ingress, provider, route, payload, inbound_headers, session_id, client, alt
             )
         expected_adapter = {
             DIALECT_OPENAI_CHAT: "openai", DIALECT_OPENAI_RESPONSES: "openai",
@@ -177,7 +211,18 @@ class App(DiscoveryRegistry):
             payload, tool_names = flatten_namespaces(payload)
         contract = self._route_entry(route if route._provider else replace(route, _provider=provider),
                                      int(time.time()), self._registry)["metadata"]["router"]
-        params, losses = _prepare_translation(provider, route, ingress, payload, contract)
+        translation = None
+        if ingress == DIALECT_GEMINI:
+            # Gemini has no LiteLLM ingress adapter. Its request becomes Chat
+            # parameters (with losses named by their Gemini paths), and the Chat
+            # result is converted back below.
+            translation = gemini.to_chat(
+                {k: v for k, v in payload.items() if k not in ("model", "stream")},
+                route.dialect, stream=bool(payload.get("stream")))
+            params, losses, native = _prepare_gemini_translation(
+                provider, route, translation, contract)
+        else:
+            params, losses, native = _prepare_translation(provider, route, ingress, payload, contract)
         provider = _translation_header_provider(provider, inbound_headers)
         transport = None
         kwargs = _thaw(provider.litellm_kwargs)
@@ -186,11 +231,14 @@ class App(DiscoveryRegistry):
         provider = replace(provider, litellm_kwargs=kwargs)
         try:
             if ingress == DIALECT_OPENAI_CHAT:
-                plan = self._from_openai_chat(provider, route, params, session_id)
+                plan = self._from_openai_chat(provider, route, params, session_id, native)
             elif ingress == DIALECT_OPENAI_RESPONSES:
-                plan = self._from_openai_responses(provider, route, params, session_id, tool_names)
+                plan = self._from_openai_responses(provider, route, params, session_id, tool_names, native)
+            elif translation is not None:
+                plan = self._from_gemini(provider, route, params, session_id, native,
+                                         translation, alt)
             else:
-                plan = self._from_anthropic(provider, route, params, session_id)
+                plan = self._from_anthropic(provider, route, params, session_id, native)
         except adapter.unsupported_params_error as exc:
             if transport is not None:
                 transport.close()
@@ -216,11 +264,19 @@ class App(DiscoveryRegistry):
         inbound_headers: Mapping[str, str],
         session_id: str | None = None,
         client: httpx.Client | None = None,
+        alt: str | None = None,
     ) -> Plan:
         assert client is not None
-        url = _upstream_url(provider, ingress)
-        body = dict(payload)
-        body["model"] = route.upstream_model
+        streaming = bool(payload.get("stream"))
+        if ingress == DIALECT_GEMINI:
+            # The model and the streaming mode live in the path, not the body.
+            url = _gemini_url(provider, route.upstream_model,
+                              "streamGenerateContent" if streaming else "generateContent", alt)
+            body = {k: v for k, v in payload.items() if k not in ("model", "stream")}
+        else:
+            url = _upstream_url(provider, ingress)
+            body = dict(payload)
+            body["model"] = route.upstream_model
         if provider.llama_cpp and ingress == DIALECT_OPENAI_CHAT:
             _apply_llama_thinking(body, body.pop("reasoning_effort", None))
 
@@ -239,7 +295,7 @@ class App(DiscoveryRegistry):
         status = response.status_code
         content_type = response.headers.get("content-type", "application/json")
 
-        if status >= 400 or not payload.get("stream"):
+        if status >= 400 or not streaming:
             try:
                 data = response.read()
             finally:
@@ -247,8 +303,7 @@ class App(DiscoveryRegistry):
             if status >= 400:
                 # Error bodies are untrusted diagnostics, not successful vendor
                 # output. Deliberately trade byte fidelity for redaction.
-                exc = RouterError(status, data.decode("utf-8", errors="replace")
-                                  or f"Upstream returned HTTP {status}")
+                exc = _upstream_error(status, data, ingress)
                 return Plan(
                     status=status,
                     headers={name: self.sanitize(value) for name, value in headers.items()
@@ -271,13 +326,15 @@ class App(DiscoveryRegistry):
             resources=(response,),
         )
 
-    def _from_openai_chat(
+    def _chat_completion(
         self,
         provider: Provider,
         route: Route,
         payload: dict[str, Any],
-        session_id: str | None = None,
-    ) -> Plan:
+        session_id: str | None,
+        native: Mapping[str, Mapping[str, Any]] | None,
+    ) -> tuple[Any, bool]:
+        """Run Chat Completions parameters against the route; (result, streaming)."""
         params = _clean_request_params(payload, DIALECT_OPENAI_CHAT)
         stream = bool(params.get("stream"))
 
@@ -292,9 +349,19 @@ class App(DiscoveryRegistry):
             model = f"{provider.litellm_provider}/{route.upstream_model}"
 
         result = adapter.completion(**adapter.call_kwargs(
-            provider, params, model=model, session_id=session_id
+            provider, params, model=model, session_id=session_id, native=native
         ))
+        return result, stream
 
+    def _from_openai_chat(
+        self,
+        provider: Provider,
+        route: Route,
+        payload: dict[str, Any],
+        session_id: str | None = None,
+        native: Mapping[str, Mapping[str, Any]] | None = None,
+    ) -> Plan:
+        result, stream = self._chat_completion(provider, route, payload, session_id, native)
         if stream:
             state = StreamState()
             return Plan(
@@ -304,6 +371,32 @@ class App(DiscoveryRegistry):
             )
         return Plan(body=_json_bytes(_sanitize_generated_errors(_jsonable(result), self.sanitize)))
 
+    def _from_gemini(
+        self,
+        provider: Provider,
+        route: Route,
+        payload: dict[str, Any],
+        session_id: str | None,
+        native: Mapping[str, Mapping[str, Any]] | None,
+        translation: gemini.Translation,
+        alt: str | None,
+    ) -> Plan:
+        """Gemini ingress on a non-Gemini route: Chat out, GenerateContentResponse back."""
+        result, stream = self._chat_completion(provider, route, payload, session_id, native)
+        if not stream:
+            data = _sanitize_generated_errors(_jsonable(result), self.sanitize)
+            return Plan(body=_json_bytes(gemini.chat_to_gemini(data, translation, route.upstream_model)))
+
+        chunks = (_sanitize_generated_errors(_jsonable(chunk), self.sanitize) for chunk in result)
+        encoded = (_json_bytes(frame) for frame in
+                   gemini.gemini_frames(chunks, translation, route.upstream_model))
+        if alt == "sse":
+            return Plan(content_type="text/event-stream",
+                        chunks=(gemini.sse_frame(frame) for frame in encoded),
+                        resources=(result,), stream_state=StreamState())
+        return Plan(content_type="application/json", chunks=gemini.json_array_frames(encoded),
+                    resources=(result,), stream_state=StreamState())
+
     def _from_openai_responses(
         self,
         provider: Provider,
@@ -311,13 +404,14 @@ class App(DiscoveryRegistry):
         payload: dict[str, Any],
         session_id: str | None = None,
         tool_names: dict[str, tuple[str, str]] | None = None,
+        native: Mapping[str, Mapping[str, Any]] | None = None,
     ) -> Plan:
         params = _clean_request_params(payload, DIALECT_OPENAI_RESPONSES)
         stream = bool(params.get("stream"))
 
         model = f"{provider.litellm_provider}/{route.upstream_model}"
         call_kwargs = adapter.call_kwargs(
-            provider, params, model=model, session_id=session_id
+            provider, params, model=model, session_id=session_id, native=native
         )
         if route.dialect == DIALECT_OPENAI_CHAT:
             call_kwargs["use_chat_completions_api"] = True
@@ -341,14 +435,15 @@ class App(DiscoveryRegistry):
         route: Route,
         payload: dict[str, Any],
         session_id: str | None = None,
+        native: Mapping[str, Mapping[str, Any]] | None = None,
     ) -> Plan:
         payload = _clean_request_params(payload, DIALECT_ANTHROPIC)
         if payload.get("max_tokens") is None:
             raise RouterError(400, "'max_tokens' is required", code="max_tokens")
         if route.dialect in (DIALECT_OPENAI_CHAT, DIALECT_GEMINI):
-            return self._anthropic_to_chat(provider, route, payload, session_id)
+            return self._anthropic_to_chat(provider, route, payload, session_id, native)
         if route.dialect == DIALECT_OPENAI_RESPONSES:
-            return self._anthropic_to_responses(provider, route, payload, session_id)
+            return self._anthropic_to_responses(provider, route, payload, session_id, native)
         raise RouterError(
             500, f"No Anthropic translation for dialect {route.dialect!r}"
         )
@@ -359,6 +454,7 @@ class App(DiscoveryRegistry):
         route: Route,
         payload: dict[str, Any],
         session_id: str | None = None,
+        native: Mapping[str, Mapping[str, Any]] | None = None,
     ) -> Plan:
         request = dict(payload)
         extensions = request.pop("extra_body", {})
@@ -399,7 +495,7 @@ class App(DiscoveryRegistry):
         result = adapter.completion(**adapter.call_kwargs(
             provider, completion_params,
             model=f"{provider.litellm_provider}/{route.upstream_model}",
-            session_id=session_id,
+            session_id=session_id, native=native,
         ))
 
         if stream:
@@ -472,11 +568,12 @@ class App(DiscoveryRegistry):
         route: Route,
         payload: dict[str, Any],
         session_id: str | None = None,
+        native: Mapping[str, Mapping[str, Any]] | None = None,
     ) -> Plan:
         handler_kwargs = adapter.call_kwargs(
             provider, payload,
             model=f"{provider.litellm_provider}/{route.upstream_model}",
-            session_id=session_id,
+            session_id=session_id, native=native,
         )
 
         result = adapter.messages_to_responses(

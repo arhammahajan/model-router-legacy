@@ -346,6 +346,7 @@ class FakeUpstream:
                     upstream.requests.append(
                         {
                             "path": path,
+                            "query": self.path.partition("?")[2],
                             "body": payload,
                             "raw_body": list(wire_body),
                             "headers": {

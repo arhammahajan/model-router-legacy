@@ -29,6 +29,16 @@ ENDPOINTS = {
     "/messages": DIALECT_ANTHROPIC,
 }
 
+# Token counting is not generation and has its own routes. Keep these out of
+# ENDPOINTS, which names generation ingress dialects.
+COUNT_TOKENS_ENDPOINTS = frozenset({"/v1/messages/count_tokens", "/messages/count_tokens"})
+# The only documented success shape is {"input_tokens": n}; anything near this
+# size is not a token count. Applies to success and error bodies alike.
+MAX_COUNT_RESPONSE_BYTES = 64 * 1024
+# The one host whose token-count endpoint is documented. Other Anthropic-protocol
+# providers must opt in with `count_tokens = true`.
+COUNT_TOKENS_NATIVE_HOSTS = frozenset({"api.anthropic.com"})
+
 DEFAULT_TIMEOUT = 600.0
 DEFAULT_MAX_BODY = 64 * 1024 * 1024
 DEFAULT_MAX_CONNECTIONS = 32
@@ -100,6 +110,9 @@ _DROP_REQUEST_HEADERS = _HOP_BY_HOP | {
     "x-api-key",
     "api-key",
     "x-goog-api-key",
+    # Quota/billing attribution is the operator's choice, never the client's.
+    "x-goog-user-project",
+    "x-goog-quota-user",
     "cookie",
     "user-agent",
 } | _REQUEST_REPRESENTATION_HEADERS
@@ -155,6 +168,24 @@ _ANTHROPIC_ERROR_TYPES = {
     413: "request_too_large",
     429: "rate_limit_error",
     529: "overloaded_error",
+}
+
+# google.rpc.Code names for the HTTP statuses the router can produce.
+_GEMINI_ERROR_STATUSES = {
+    400: "INVALID_ARGUMENT",
+    401: "UNAUTHENTICATED",
+    403: "PERMISSION_DENIED",
+    404: "NOT_FOUND",
+    408: "DEADLINE_EXCEEDED",
+    409: "ABORTED",
+    413: "INVALID_ARGUMENT",
+    429: "RESOURCE_EXHAUSTED",
+    499: "CANCELLED",
+    500: "INTERNAL",
+    501: "UNIMPLEMENTED",
+    502: "UNAVAILABLE",
+    503: "UNAVAILABLE",
+    504: "DEADLINE_EXCEEDED",
 }
 
 DISCOVERY_CACHE_VERSION = 1

@@ -5,7 +5,7 @@ import os
 from importlib import metadata as importlib_metadata
 from typing import Any, Iterator, Mapping
 
-from .common import RouterError, _apply_llama_thinking, _close_quietly
+from .common import RouterError, _close_quietly
 from .config import Provider
 from .constants import _TRANSLATION_HEADERS, DIALECT_OPENAI_CHAT, TESTED_LITELLM_VERSION
 from .headers import _set_header
@@ -46,6 +46,9 @@ try:
         LiteLLMMessagesToResponsesAPIHandler,
     )
     from litellm.llms.custom_httpx.http_handler import HTTPHandler
+    from litellm.llms.vertex_ai.gemini.vertex_and_google_ai_studio_gemini import (
+        VertexGeminiConfig,
+    )
 
     # 1.106.4 imports this even when skip_mcp_handler=True. Require its extra
     # at installation/startup instead of failing on the first Responses call.
@@ -108,7 +111,7 @@ class _TranslationHTTPTransport(HTTPHandler):
 
 def _translation_call_kwargs(
     provider: Provider, params: Mapping[str, Any], *, model: str,
-    session_id: str | None,
+    session_id: str | None, native: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Merge only validated generation data, then trusted server settings."""
     # These globals can inject auth after argument merging or via a client's
@@ -122,21 +125,12 @@ def _translation_call_kwargs(
     # Never promote arbitrary extra_body members into keyword arguments.
     if "thinking" in body:
         generation["thinking"] = body.pop("thinking")
-    if provider.llama_cpp:
-        # Same effort mapping as the Chat pass-through, for translated ingresses.
-        effort = generation.pop("reasoning_effort", None)
-        reasoning = generation.get("reasoning")
-        if isinstance(reasoning, dict) and "effort" in reasoning:
-            effort = reasoning["effort"]
-            rest = {k: v for k, v in reasoning.items() if k != "effort"}
-            if rest:
-                generation["reasoning"] = rest
-            else:
-                del generation["reasoning"]
-        native: dict[str, Any] = {}
-        _apply_llama_thinking(native, effort)
-        for key, value in native.items():
-            body.setdefault(key, value)
+    # Router-planned reasoning controls (see reasoning.py) replace whatever the
+    # adapter would have derived: explicit native values, never adapter tables.
+    for key, value in ((native or {}).get("completion") or {}).items():
+        generation[key] = value
+    for key, value in ((native or {}).get("body") or {}).items():
+        body[key] = value
     trusted = provider.litellm_call_kwargs(skip_mcp=True, session_id=session_id)
     if trusted.get("additional_drop_params") or litellm.drop_params:
         raise RouterError(500, "LiteLLM parameter dropping bypasses compatibility diagnostics; "
@@ -176,6 +170,17 @@ class LiteLLMAdapter:
 
     def supported_openai_params(self, **kwargs: Any) -> Any:
         return litellm.get_supported_openai_params(**kwargs)
+
+    def gemini_thinking_levels(self, model: str) -> bool:
+        """Whether the Gemini adapter sends ``reasoning_effort`` as a native thinking level.
+
+        Newer Gemini models take ``thinkingLevel`` (low/medium/high by name); older
+        ones get a token budget derived from the effort, which is only an estimate.
+        """
+        try:
+            return bool(VertexGeminiConfig.is_gemini_3_or_newer(model))
+        except Exception:  # an adapter that cannot say is treated as approximating
+            return False
 
     def messages_input(self, *args: Any, **kwargs: Any) -> Any:
         return _ANTHROPIC_ADAPTER.translate_completion_input_params_with_tool_mapping(*args, **kwargs)

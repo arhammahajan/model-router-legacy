@@ -65,7 +65,8 @@ deadline = 600                  # total dispatch + upstream IO + backoff + strea
 # For OpenAI dialects, include the version path in base_url (usually /v1).
 # For Anthropic, use the origin (https://api.anthropic.com) or a prefix; LiteLLM
 # appends /v1/messages. A base_url ending in /v1/messages is also accepted.
-# For Gemini, include /v1beta in base_url.
+# For Gemini, include /v1beta in base_url. A "gemini" provider is also reachable
+# natively through the router's /v1beta/models/{model}:generateContent ingress.
 #
 # Credential isolation: a nonempty api_key/api_key_env/api_key_file selects that
 # key, with surrounding whitespace stripped. Omitted/literal empty api_key values
@@ -84,6 +85,11 @@ deadline = 600                  # total dispatch + upstream IO + backoff + strea
 #
 # auth_header (optional): "bearer", "x-api-key", or "api-key" to force how the
 #   upstream key is sent. Empty leaves the provider default.
+# count_tokens (optional, anthropic dialect only): whether this upstream implements
+#   POST <base_url>/v1/messages/count_tokens. Unset assumes yes only for
+#   https://api.anthropic.com. Set true after confirming a compatible provider
+#   has the endpoint; false disables it. Unsupported routes return HTTP 400
+#   rather than an estimate.
 # session_header (optional): upstream stable conversation header, e.g.
 #   "x-opencode-session". Client must reuse one ID per conversation.
 # session_source_headers: ordered subset of reviewed native conversation headers.

@@ -7,6 +7,7 @@ from typing import Any, Mapping
 
 import router_metadata
 
+from . import gemini
 from .adapters import adapter
 from .common import RouterError, _thaw
 from .config import Provider, Route
@@ -17,6 +18,7 @@ from .constants import (
     DIALECT_OPENAI_CHAT,
     DIALECT_OPENAI_RESPONSES,
 )
+from .reasoning import plan_reasoning
 
 
 def _generation_error(field: str) -> RouterError:
@@ -39,6 +41,12 @@ def _validate_ingress(
     model = payload.get("model")
     if not isinstance(model, str) or not model.strip():
         raise RouterError(400, "A model ID is required", code="model_required")
+    if ingress == DIALECT_GEMINI:
+        # The model and streaming mode come from the URL; the body is the native one.
+        if type(payload.get("stream")) is not bool:
+            invalid("stream", "must be bool")
+        gemini.check_shape({k: v for k, v in payload.items() if k not in ("model", "stream")})
+        return
 
     def finite(value: Any) -> None:
         if isinstance(value, float) and not math.isfinite(value):
@@ -171,6 +179,15 @@ def _validate_thinking(value: Any) -> None:
     _closed_generation_object(value, {
         "type": str, "budget_tokens": int, "display": str, "summary": str,
     }, "thinking")
+    # A missing or unknown type must not be left for an adapter to default; one
+    # of them silently turns thinking off.
+    kind = value.get("type")
+    budget = value.get("budget_tokens")
+    if (kind not in ("enabled", "disabled", "adaptive")
+            or (budget is None) != (kind != "enabled")
+            or (budget is not None and budget < 1)
+            or value.get("display", "summarized") not in ("summarized", "omitted")):
+        raise _generation_error("thinking")
 
 
 def _validated_generation_extensions(value: Any) -> dict[str, Any]:
@@ -329,10 +346,65 @@ def _reconcile_tools(params: dict[str, Any], ingress: str) -> list[dict[str, str
     return losses
 
 
+def _pop_path(params: dict[str, Any], path: str) -> None:
+    node: Any = params
+    parts = path.split(".")
+    for key in parts[:-1]:
+        node = node.get(key, {}) if isinstance(node, dict) else {}
+    if isinstance(node, dict):
+        node.pop(parts[-1], None)
+
+
+# Responses-only controls: say what the destination cannot do rather than that no
+# mapping was reviewed.
+_RESPONSES_ONLY_REASONS = {
+    "store": "this destination cannot honor the storage preference; "
+             "retention follows the upstream's own policy",
+    "include": "Responses-only response fields (such as encrypted reasoning) "
+               "cannot be returned by this destination",
+}
+
+
+def _enforce_policy(provider: Provider, losses: list[dict[str, str]]) -> None:
+    """Strict providers refuse any reported loss; lossy providers carry it as a header."""
+    if losses and not provider.drop_params:
+        detail = "; ".join(dict.fromkeys(
+            f"{loss['field']} ({loss['reason']})" for loss in losses))
+        raise RouterError(400, f"Translation would lose or approximate: {detail}. "
+                          "Use a same-protocol route, remove these controls, or ask the operator "
+                          "to configure compatibility = 'lossy' (with loss diagnostics).",
+                          code="translation_loss")
+
+
+def _prepare_gemini_translation(
+    provider: Provider, route: Route, translation: gemini.Translation,
+    contract: Mapping[str, Any],
+) -> tuple[dict[str, Any], list[dict[str, str]], dict[str, dict[str, Any]]]:
+    """Plan a Gemini request that was rewritten to Chat parameters.
+
+    The Chat stage knows nothing of Gemini field names, so its losses are renamed
+    to the Gemini path the client actually sent, and the strict/lossy decision is
+    taken once over both stages' losses.
+    """
+    params, chat_losses, native = _prepare_translation(
+        provider, route, DIALECT_OPENAI_CHAT, translation.params, contract, enforce=False)
+    losses = [*translation.losses,
+              *({**loss, "field": translation.rename(loss["field"])} for loss in chat_losses)]
+    _enforce_policy(provider, losses)
+    extension = params.get("extra_body")
+    if route.dialect == DIALECT_ANTHROPIC and isinstance(extension, dict) and "top_k" in extension:
+        # LiteLLM sends Anthropic's top_k as a provider keyword argument; it only
+        # reaches an OpenAI-compatible body through extra_body.
+        native["completion"]["top_k"] = extension.pop("top_k")
+        if not extension:
+            del params["extra_body"]
+    return params, losses, native
+
+
 def _prepare_translation(
     provider: Provider, route: Route, ingress: str, payload: Mapping[str, Any],
-    contract: Mapping[str, Any],
-) -> tuple[dict[str, Any], list[dict[str, str]]]:
+    contract: Mapping[str, Any], *, enforce: bool = True,
+) -> tuple[dict[str, Any], list[dict[str, str]], dict[str, dict[str, Any]]]:
     """Conservative, body-only bridge contract; unknown model facts are neutral.
 
     An adapter's supported-parameter list describes its mapping, not proof of
@@ -352,11 +424,7 @@ def _prepare_translation(
         losses.append({"field": path, "reason": reason,
                        "action": "approximated" if approximate else "dropped"})
         if not approximate:
-            node = params
-            parts = path.split(".")
-            for key in parts[:-1]:
-                node = node.get(key, {})
-            node.pop(parts[-1], None)
+            _pop_path(params, path)
 
     if route.dialect == DIALECT_GEMINI:
         # Anthropic cache hints make LiteLLM create Gemini cachedContents via
@@ -406,7 +474,8 @@ def _prepare_translation(
             mapped -= {"top_k", "stop_sequences"}
     for key, item in list(params.items()):
         if item is not None and key not in mapped | {"extra_body"}:
-            lose(key, "no reviewed bridge mapping")
+            lose(key, _RESPONSES_ONLY_REASONS.get(key, "no reviewed bridge mapping")
+                 if ingress == DIALECT_OPENAI_RESPONSES else "no reviewed bridge mapping")
 
     # Tri-state facts: only explicit false/known enums reject a request. Unknown
     # metadata never prevents an otherwise available adapter mapping.
@@ -438,46 +507,20 @@ def _prepare_translation(
             and "disable_parallel_tool_use" in params["tool_choice"]):
         lose("tool_choice.disable_parallel_tool_use", "parallel tool constraint has no bridge mapping")
 
-    reasoning_key = "reasoning_effort" if ingress == DIALECT_OPENAI_CHAT else "reasoning"
-    reasoning = params.get(reasoning_key)
-    effort = reasoning.get("effort") if isinstance(reasoning, dict) else reasoning
-    if reasoning is not None:
-        if value("reasoning.supported") is False or value("reasoning.effort.supported") is False:
-            lose(reasoning_key, "model capability is unsupported")
-        elif effort is not None and value("reasoning.effort.values") is not None and effort not in value("reasoning.effort.values"):
-            lose(reasoning_key, "effort is outside the model's known values")
-        elif effort == "none" and route.dialect == DIALECT_ANTHROPIC:
-            lose(reasoning_key, "adapter omits this control instead of explicitly disabling thinking")
-        elif isinstance(reasoning, dict) and route.dialect != DIALECT_OPENAI_RESPONSES:
-            for key in list(reasoning):
-                if key != "effort":
-                    lose(f"{reasoning_key}.{key}", "reasoning detail has no reviewed bridge mapping")
-
-    thinking_path = "thinking" if "thinking" in params else "extra_body.thinking"
-    thinking = params.get("thinking", params.get("extra_body", {}).get("thinking"))
-    if thinking is not None:
-        if value("reasoning.supported") is False:
-            lose(thinking_path, "model capability is unsupported")
-        elif (thinking.get("budget_tokens") is not None
-              and value("reasoning.budget.supported") is False):
-            lose(thinking_path, "model budget control is unsupported")
-        elif (thinking.get("budget_tokens") is not None
-              and ((value("reasoning.budget.min_tokens") is not None
-                    and thinking["budget_tokens"] < value("reasoning.budget.min_tokens"))
-                   or (value("reasoning.budget.max_tokens") is not None
-                       and thinking["budget_tokens"] > value("reasoning.budget.max_tokens")))):
-            lose(thinking_path, "budget is outside the model's known bounds")
-        elif route.dialect != DIALECT_ANTHROPIC:
-            if value("reasoning.effort.supported") is False:
-                lose(thinking_path, "target effort control is unsupported")
-            elif ingress == DIALECT_ANTHROPIC and thinking.get("type") == "enabled":
-                # LiteLLM maps a token budget to an effort bucket. Keep that
-                # useful mapping only when the operator explicitly accepts loss.
-                lose(thinking_path, "token budget becomes an approximate effort", approximate=True)
-            else:
-                lose(thinking_path, "native thinking control requires a native route")
-        elif route.dialect == DIALECT_ANTHROPIC and thinking.get("type") == "adaptive":
-            lose(thinking_path, "adaptive thinking may become a token budget", approximate=True)
+    # Reasoning controls are planned as one unit: each is mapped exactly, kept for
+    # the adapter as an approximation, or lost. Router-owned native values travel
+    # beside the params so the adapter cannot re-derive them with its own tables.
+    reasoning_plan = plan_reasoning(
+        ingress, route.dialect, provider.llama_cpp, params, value,
+        gemini_levels=(route.dialect == DIALECT_GEMINI and adapter.gemini_thinking_levels(
+            f"{provider.litellm_provider}/{route.upstream_model}")))
+    losses.extend(reasoning_plan.losses)
+    for path in reasoning_plan.strip:
+        _pop_path(params, path)
+    for key in ("reasoning", "output_config"):
+        if params.get(key) == {}:
+            del params[key]
+    native = {"completion": reasoning_plan.completion, "body": reasoning_plan.body}
 
     formats = [("response_format", params.get("response_format")),
                ("text.format", (params.get("text") or {}).get("format")),
@@ -506,9 +549,6 @@ def _prepare_translation(
                 # Unknown nested keys must never become diagnostic/header data.
                 lose("text", "text controls beyond format have no reviewed bridge mapping")
                 break
-    if (params.get("output_config") or {}).get("effort") is not None:
-        lose("output_config.effort", "native effort control has no reviewed bridge mapping")
-
     # A provider's Chat mapping table also applies after Responses/Messages
     # normalization. Responses-native calls do not go through this table.
     if route.dialect != DIALECT_OPENAI_RESPONSES:
@@ -530,16 +570,32 @@ def _prepare_translation(
                 if key == "thinking" and ingress == DIALECT_ANTHROPIC:
                     mapped_key = "reasoning_effort"
                 if mapped_key not in supported:
+                    if key == "store" and item is False and ingress == DIALECT_OPENAI_CHAT:
+                        # Chat Completions stores nothing unless asked to, so
+                        # `store: false` is the default; a destination with no stored
+                        # completions already satisfies it. `store: true` is still lost.
+                        del params["store"]
+                        continue
                     lose(key, "target adapter has no mapping for this control")
         if ("thinking" in params.get("extra_body", {}) and supported is not None
                 and "thinking" not in supported):
             lose("extra_body.thinking", "target adapter has no mapping for this control")
+        # Router-planned controls reach the same adapter, which refuses what its
+        # model has no mapping for; report that instead of failing the request.
+        for key in list(native["completion"]):
+            mapped_key = "reasoning_effort" if key == "reasoning" else key
+            if supported is not None and mapped_key not in supported:
+                del native["completion"][key]
+                losses.append({"field": reasoning_plan.origins.get(key, key), "action": "dropped",
+                               "reason": "target adapter has no mapping for this control"})
 
-    if losses and not provider.drop_params:
-        detail = "; ".join(dict.fromkeys(
-            f"{loss['field']} ({loss['reason']})" for loss in losses))
-        raise RouterError(400, f"Translation would lose or approximate: {detail}. "
-                          "Use a same-protocol route, remove these controls, or ask the operator "
-                          "to configure compatibility = 'lossy' (with loss diagnostics).",
-                          code="translation_loss")
-    return params, losses
+    # An approximation the target adapter then refuses outright was never applied.
+    dropped = {item["field"] for item in losses if item["action"] == "dropped"}
+    losses = [item for item in losses
+              if not (item["action"] == "approximated"
+                      and any(item["field"] == path or item["field"].startswith(path + ".")
+                              for path in dropped))]
+
+    if enforce:
+        _enforce_policy(provider, losses)
+    return params, losses, native

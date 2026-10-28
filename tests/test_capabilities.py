@@ -126,7 +126,7 @@ def test_props_capabilities_and_corrected_limits(monkeypatch: pytest.MonkeyPatch
         assert found["protocols"]["native"]["openai-chat"]["value"] is True
         assert found["protocols"]["native"]["anthropic"]["value"] is None
         assert found["protocols"]["translated"]["anthropic"]["value"] is True
-        assert found["protocols"]["translated"]["gemini"]["value"] is False
+        assert found["protocols"]["translated"]["gemini"]["value"] is True
         assert found["protocols"]["known_lossy_features"]["value"] is None
         assert "dummy-never-advertise" not in json.dumps(payload)
         assert len(discovery.requests) == 3

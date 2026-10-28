@@ -12,7 +12,9 @@ import httpx
 
 from .constants import (
     _ANTHROPIC_ERROR_TYPES,
+    _GEMINI_ERROR_STATUSES,
     DIALECT_ANTHROPIC,
+    DIALECT_GEMINI,
     DIALECT_OPENAI_CHAT,
     DIALECT_OPENAI_RESPONSES,
     LLAMA_THINKING_BUDGETS,
@@ -148,6 +150,18 @@ def _error_payload(
     code = sanitize(str(code)) if code is not None else None
     error_type = sanitize(str(error_type)) if error_type is not None else None
 
+    if ingress == DIALECT_GEMINI:
+        # google.rpc.Status: `code` is the HTTP status, `status` the canonical name.
+        if error_type is None or not re.fullmatch(r"[A-Z][A-Z_]{2,39}", error_type):
+            error_type = _GEMINI_ERROR_STATUSES.get(
+                status, "INTERNAL" if status >= 500 else "INVALID_ARGUMENT")
+        body: dict[str, Any] = {"code": status, "message": message, "status": error_type}
+        if code:
+            body["details"] = [{"@type": "type.googleapis.com/google.rpc.ErrorInfo",
+                                "reason": re.sub(r"[^A-Z0-9_]", "_", code.upper()),
+                                "domain": "model-router"}]
+        return {"error": body}
+
     if ingress == DIALECT_ANTHROPIC:
         if error_type is None:
             error_type = _ANTHROPIC_ERROR_TYPES.get(
@@ -194,7 +208,7 @@ def _stream_error_payload(
     ingress: str, exc: BaseException,
     sanitize: ErrorSanitizer = _DEFAULT_SANITIZER,
 ) -> dict[str, Any]:
-    if ingress == DIALECT_ANTHROPIC:
+    if ingress in (DIALECT_ANTHROPIC, DIALECT_GEMINI):
         return _error_payload(ingress, exc, sanitize)
     if ingress == DIALECT_OPENAI_RESPONSES:
         payload = _error_payload(ingress, exc, sanitize)["error"]
@@ -211,8 +225,15 @@ def _stream_error_bytes(
     ingress: str, exc: BaseException,
     sanitize: ErrorSanitizer = _DEFAULT_SANITIZER,
     state: StreamState | None = None,
+    array: bool = False,
 ) -> bytes:
     payload = _stream_error_payload(ingress, exc, sanitize)
+    if ingress == DIALECT_GEMINI:
+        # Gemini has no terminator: an error object is the last frame, either
+        # an SSE data frame or (without alt=sse) the last element of the array.
+        if array:
+            return b",\r\n" + _json_bytes(payload) + b"]"
+        return b"data: " + _json_bytes(payload) + b"\n\n"
     if ingress == DIALECT_OPENAI_RESPONSES and state is not None:
         payload = state.number(payload)
     if ingress == DIALECT_OPENAI_CHAT:

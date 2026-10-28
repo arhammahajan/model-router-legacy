@@ -344,12 +344,20 @@ def test_supported_reasoning_controls_reach_provider(upstream, ingress, model, s
         raw["models"][0]["model"] = "claude-sonnet-4-20250514"
     if model == "m-resp":
         raw["models"][2]["model"] = "o3"
+    # Effort has no equal on Anthropic or Gemini: both adapters map it through a
+    # budget table, which is an approximation and is reported as one.
+    approximated = model in ("m-anth", "m-gem") and ingress != "anthropic"
+    if approximated:
+        raw["providers"]["anth" if model == "m-anth" else "gem"]["compatibility"] = "lossy"
     body = {**_body(ingress, model, stream), **control(ingress, "reasoning")}
     body["max_tokens" if ingress != "openai-responses" else "max_output_tokens"] = 32768
     with router_config(raw) as base:
         reply = httpx.post(base + PATHS[ingress], json=body, timeout=15)
     assert reply.status_code == 200, reply.text
-    assert "x-model-router-loss" not in reply.headers
+    if approximated:
+        assert [item["action"] for item in json.loads(reply.headers["x-model-router-loss"])] == ["approximated"]
+    else:
+        assert "x-model-router-loss" not in reply.headers
     sent = upstream.requests[-1]["body"]
     if model == "m-anth":
         assert sent["thinking"] == {"type": "enabled", "budget_tokens": 4096}

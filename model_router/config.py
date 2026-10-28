@@ -19,6 +19,7 @@ from .constants import (
     _ENV_PATTERN,
     _HTTP_TOKEN,
     _NATIVE_SESSION_HEADERS,
+    COUNT_TOKENS_NATIVE_HOSTS,
     DEFAULT_BODY_READ_TIMEOUT,
     DEFAULT_HEADER_READ_TIMEOUT,
     DEFAULT_LLAMA_CONTEXT,
@@ -169,7 +170,7 @@ _PROVIDER_FIELDS = {
         "session_missing", "auth_header",
     )}, "headers": (dict,), "timeout": (int, float), "litellm_kwargs": (dict,),
     "drop_params": (bool,), "session_source_headers": (list,),
-    "session_prompt_cache_key": (bool,),
+    "session_prompt_cache_key": (bool,), "count_tokens": (bool,),
 }
 
 
@@ -192,10 +193,28 @@ class Provider:
     # Discovered llama.cpp server: reasoning effort is mapped to its native
     # thinking controls instead of being forwarded as reasoning_effort.
     llama_cpp: bool = False
+    # Whether this upstream has an Anthropic token-count endpoint. None means
+    # "decide from the base URL"; True/False is an operator assertion.
+    count_tokens: bool | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "headers", _freeze(self.headers))
         object.__setattr__(self, "litellm_kwargs", _freeze(self.litellm_kwargs))
+
+    @property
+    def count_tokens_enabled(self) -> bool:
+        """Only an Anthropic-protocol provider known or declared to count tokens.
+
+        Anthropic-compatible does not imply a /count_tokens endpoint. Absent an
+        explicit setting, only the documented first-party host qualifies; the
+        exact netloc comparison rejects userinfo, ports and look-alike hosts.
+        """
+        if self.dialect != DIALECT_ANTHROPIC or self.count_tokens is False:
+            return False
+        if self.count_tokens:
+            return True
+        parts = urlsplit(self.base_url)
+        return parts.scheme == "https" and parts.netloc.lower() in COUNT_TOKENS_NATIVE_HOSTS
 
     @property
     def effective_api_key(self) -> str:
@@ -583,6 +602,11 @@ def _build_provider(name: str, raw: Mapping[str, Any]) -> Provider:
         )
     auth_header = auth_header.lower()
 
+    count_tokens = raw.get("count_tokens")
+    if count_tokens and dialect != DIALECT_ANTHROPIC:
+        raise SystemExit(f"{where}: 'count_tokens' can only be enabled for the "
+                         f"{DIALECT_ANTHROPIC!r} dialect")
+
     return Provider(
         name=name,
         dialect=dialect,
@@ -598,6 +622,7 @@ def _build_provider(name: str, raw: Mapping[str, Any]) -> Provider:
         session_source_headers=source_headers,
         session_prompt_cache_key=cache_fallback,
         session_missing=session_missing,
+        count_tokens=count_tokens,
     )
 
 

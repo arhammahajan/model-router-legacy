@@ -13,6 +13,23 @@ const PROVIDER = "model-router";
 
 const val = (x: any) => x?.value ?? undefined;
 
+// Pi offers minimal..high unless a level is marked unsupported (null), and
+// xhigh/max only when they are mapped. Offer exactly the efforts the route
+// publishes, so Pi never sends a level the router would have to refuse.
+function thinkingLevels(values: unknown): Record<string, string | null> | undefined {
+  if (!Array.isArray(values)) return undefined;
+  const map: Record<string, string | null> = {};
+  for (const level of ["minimal", "low", "medium", "high"]) {
+    if (!values.includes(level)) map[level] = null;
+  }
+  for (const level of ["xhigh", "max"]) {
+    if (values.includes(level)) map[level] = level;
+  }
+  // Without a mapping pi sends nothing for "off" and the upstream keeps thinking.
+  if (values.includes("none")) map.off = "none";
+  return map;
+}
+
 async function discover(signal?: AbortSignal): Promise<any[]> {
   const timeout = AbortSignal.timeout(5000);
   const res = await fetch(`${ORIGIN}/v1/models`, {
@@ -33,8 +50,8 @@ async function discover(signal?: AbortSignal): Promise<any[]> {
     const model: any = {
       id: m.id,
       name: isLlama ? `${m.id} (llama.cpp)` : m.id,
-      // Thinking levels are mapped server-side for llama.cpp, which the router
-      // advertises as reasoning.effort support.
+      // The router advertises effort support for llama.cpp, where it maps the
+      // levels server-side.
       reasoning:
         val(caps.reasoning?.supported) === true || val(caps.reasoning?.effort?.supported) === true,
       input: val(caps.modalities?.input?.image) ? ["text", "image"] : ["text"],
@@ -45,11 +62,18 @@ async function discover(signal?: AbortSignal): Promise<any[]> {
       maxTokens: md.max_tokens ?? val(caps.limits?.max_output_tokens) ?? 16384,
     };
 
-    if (isLlama) {
-      // Wire format only: have pi send reasoning_effort (including "none" for
-      // off, and xhigh/max). The router maps it to llama.cpp's native fields.
-      model.compat = { supportsReasoningEffort: true };
-      model.thinkingLevelMap = { off: "none", xhigh: "xhigh", max: "max" };
+    if (dialect === "openai-chat" || dialect === "gemini") {
+      // llama.cpp publishes none..xhigh, so this also gives pi its off ("none")
+      // and xhigh levels; the router maps them to llama.cpp's native fields.
+      const levels = model.reasoning ? thinkingLevels(val(caps.reasoning?.effort?.values)) : undefined;
+      if (levels) model.thinkingLevelMap = levels;
+    }
+
+    if (dialect === "gemini" && !Array.isArray(val(caps.reasoning?.effort?.values))) {
+      // The router can carry an effort to Gemini exactly only as a native thinking
+      // level, which it knows only for routes that publish their levels. Anything
+      // else is a token-budget estimate that a strict router refuses.
+      model.reasoning = false;
     }
 
     if (dialect === "anthropic") {
@@ -59,10 +83,6 @@ async function discover(signal?: AbortSignal): Promise<any[]> {
     } else if (dialect === "openai-responses") {
       model.api = "openai-responses";
       model.baseUrl = `${ORIGIN}/v1`;
-    } else if (dialect === "gemini") {
-      // Chat ingress; the router refuses to drop store/stream_options silently.
-      model.reasoning = false;
-      model.compat = { supportsStore: false, supportsUsageInStreaming: false };
     }
     return model;
   });

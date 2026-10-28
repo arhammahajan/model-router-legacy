@@ -40,7 +40,7 @@ Paths are relative to `metadata.router`.
 | `protocols.known_lossy_features` | Established translation losses; `null` means unknown, not lossless |
 | `freshness`, `sources` | Age and evidence for the above |
 
-Dialects are `openai-chat`, `openai-responses`, `anthropic` and `gemini`. Gemini has no ingress, so its `translated` value is `false`. A same-dialect route is pass-through, so its `translated` is also `false`.
+Dialects are `openai-chat`, `openai-responses`, `anthropic` and `gemini`. A same-dialect route is pass-through, so its `translated` value is `false`; every other ingress, Gemini included, is `true`.
 
 A native mapping has `protocol`, a dotted JSON `path`, and optionally `values`:
 
@@ -62,7 +62,7 @@ It describes the native request body, not a portable SDK argument. Overrides nev
 
 Facts come from `/v1/models`, `/props`, `chat_template_caps` and build info. Per-model `/props` outranks model-list flags, and overrides outrank both. Router mode queries only loaded or sleeping models, with `autoload=false`. Missing flags stay unknown, and model names are never used to infer controls.
 
-The router maps reasoning effort to llama.cpp's native fields (see the README), so it reports `reasoning.effort` as supported with kind `configured` and source `router.llama_thinking_map`. That says the control exists, not that the loaded model produces thinking. `reasoning.supported` stays whatever the server reported.
+The router maps reasoning effort to llama.cpp's native fields (see the README), so it reports `reasoning.effort` as supported with kind `configured` and source `router.llama_thinking_map`. Its values are the levels the router maps (`none` to `xhigh`); `max` is not listed because llama.cpp has no maximum level. That says the control exists, not that the loaded model produces thinking. `reasoning.supported` stays whatever the server reported.
 
 ### OpenCode Go
 

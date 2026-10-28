@@ -20,8 +20,9 @@ SAMPLING = (
     "top_n_sigma", "adaptive_target", "adaptive_decay", "dry_sequence_breakers",
 )
 # Effort levels the router maps to llama.cpp thinking controls; see
-# model_router._apply_llama_thinking.
-LLAMA_EFFORT_VALUES = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
+# model_router._apply_llama_thinking. "max" is absent: llama.cpp has no maximum
+# level, so a translated request for it is reported instead of sending nothing.
+LLAMA_EFFORT_VALUES = ("none", "minimal", "low", "medium", "high", "xhigh")
 LIMITS = ("context_window","trained_context_window", "max_input_tokens",
           "max_output_tokens", "default_output_tokens")
 
@@ -118,7 +119,7 @@ def empty(dialect: str) -> dict[str, Any]:
     put(result, f"protocols.native.{dialect}", True, "routing.dialect", "configured")
     for protocol in PROTOCOLS:
         put(result, f"protocols.translated.{protocol}",
-            protocol != dialect and protocol != "gemini", "routing.adapters", "configured")
+            protocol != dialect, "routing.adapters", "configured")
     result["sources"]["routing"] = {"verification": "configured transport and adapter paths only"}
     return result
 

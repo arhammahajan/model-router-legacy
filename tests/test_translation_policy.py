@@ -162,24 +162,27 @@ def test_invalid_policy_is_rejected(upstream, bad):
 
 
 @pytest.mark.parametrize("ingress", ["openai-chat", "openai-responses"])
-def test_supported_effort_to_anthropic_budget_reaches_upstream(upstream, ingress):
+@pytest.mark.parametrize("lossy", [False, True])
+def test_effort_to_anthropic_budget_is_an_approximation(upstream, ingress, lossy):
     raw = _config(upstream)
     raw["models"][0]["model"] = "claude-3-7-sonnet-20250219"
+    raw["providers"]["anth"]["compatibility"] = "lossy" if lossy else "strict"
     with router_config(raw) as base:
         response = httpx.post(base + PATHS[ingress], json={
             **_body(ingress, "m-anth", False), **control(ingress, "reasoning"),
             ("max_tokens" if ingress == "openai-chat" else "max_output_tokens"): 40000,
         })
+    if not lossy:
+        assert response.status_code == 400, response.text
+        assert "approximate" in response.text
+        assert upstream.requests == []
+        return
     assert response.status_code == 200, response.text
-    assert "x-model-router-loss" not in response.headers
+    losses = json.loads(response.headers["x-model-router-loss"])
+    assert [(item["field"].split(".")[0], item["action"]) for item in losses] == [
+        ("reasoning_effort" if ingress == "openai-chat" else "reasoning", "approximated")]
     sent = upstream.last_request("/v1/messages")["body"]
     assert sent["thinking"] == {"type": "enabled", "budget_tokens": 4096}
-
-
-
-
-
-
 
 
 def test_legacy_drop_params_selects_diagnosed_lossy_policy(upstream):
@@ -220,3 +223,35 @@ def test_native_vendor_fields_bypass_translation_policy(upstream, ingress, model
 
 
 
+
+
+@pytest.mark.parametrize("model", ["m-gem", "m-anth"])
+@pytest.mark.parametrize("policy", ["strict", "lossy"])
+def test_chat_store_false_is_the_default_and_loses_nothing(upstream, model, policy):
+    """Chat Completions stores nothing unless asked, so `store: false` needs no mapping."""
+    raw = _with_gemini(_config(upstream), upstream)
+    for provider in raw["providers"].values():
+        provider["compatibility"] = policy
+    body = {"model": model, "messages": [{"role": "user", "content": "hello"}],
+            "max_tokens": 64, "store": False, "stream_options": {"include_usage": True}}
+    with router_config(raw) as base:
+        response = httpx.post(base + "/v1/chat/completions", json=body, timeout=30)
+    assert response.status_code == 200, response.text
+    assert "x-model-router-loss" not in response.headers
+    assert all("store" not in request["body"] for request in upstream.requests)
+
+
+@pytest.mark.parametrize("policy", ["strict", "lossy"])
+def test_chat_store_true_cannot_be_honored_by_a_destination_without_stored_completions(upstream, policy):
+    raw = _with_gemini(_config(upstream), upstream)
+    for provider in raw["providers"].values():
+        provider["compatibility"] = policy
+    body = {"model": "m-gem", "messages": [{"role": "user", "content": "hello"}],
+            "max_tokens": 64, "store": True}
+    with router_config(raw) as base:
+        response = httpx.post(base + "/v1/chat/completions", json=body, timeout=30)
+    if policy == "strict":
+        assert response.status_code == 400 and "store" in response.text
+    else:
+        (loss,) = json.loads(response.headers["x-model-router-loss"])
+        assert loss["field"] == "store" and loss["action"] == "dropped"

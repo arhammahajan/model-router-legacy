@@ -18,7 +18,10 @@ if TYPE_CHECKING:
 class _RequestBudget:
     """One monotonic budget, including backoff and all upstream stream reads."""
 
-    def __init__(self, app: App) -> None:
+    def __init__(self, app: App, *, counting: bool = False) -> None:
+        # A token count is free and starts no generation, so its failures must not
+        # warn about billing. The deadline, retry and no-replay rules are shared.
+        self.counting = counting
         self.policy = app.config.retry
         self.clock, self.sleep, self.jitter = app._clock, app._sleep, app._jitter
         self.wall_clock = app._wall_clock
@@ -28,7 +31,9 @@ class _RequestBudget:
         self.output_started = False
 
     def error(self) -> RouterError:
-        exc = RouterError(504, "Overall upstream request deadline exceeded; generation may "
+        exc = RouterError(504, "Overall upstream request deadline exceeded."
+                          if self.counting else
+                          "Overall upstream request deadline exceeded; generation may "
                           "have been accepted and billed. The router will not replay it.",
                           code="request_deadline_exceeded")
         exc.headers = self.headers
@@ -46,6 +51,9 @@ class _RequestBudget:
     def ambiguous(self, exc: BaseException) -> RouterError:
         self.timeout()
         error = RouterError(504 if isinstance(exc, httpx.TimeoutException) else 502,
+                            "The upstream failed while answering the token-count request. "
+                            "The router will not replay it."
+                            if self.counting else
                             "The upstream failed after the request may have been sent; "
                             "generation may have been accepted and billed. The router "
                             "will not replay it.", code="upstream_outcome_unknown")

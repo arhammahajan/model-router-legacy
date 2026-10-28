@@ -16,13 +16,14 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Iterable, Mapping
 from urllib.parse import parse_qsl, unquote, urlsplit
 
 import httpx
 
 import router_metadata
 
+from . import gemini
 from .common import (
     ErrorSanitizer,
     RouterError,
@@ -778,17 +779,23 @@ class DiscoveryRegistry:
                 public=tuple(public), catalog=catalog, llama=llama,
             )
 
-    def authorized(self, headers: Mapping[str, str]) -> bool:
+    def authorized(self, headers: Mapping[str, str], query_keys: Iterable[str] = ()) -> bool:
+        """Router client authentication.
+
+        ``query_keys`` are the values of a ``?key=`` parameter; only the Gemini
+        endpoints pass them, since that is how Gemini clients may send their key.
+        """
         if not self.config.api_keys:
             return True
         candidates: list[str] = []
         authorization = headers.get("Authorization", "")
         if authorization.lower().startswith("bearer "):
             candidates.append(authorization[7:].strip())
-        for name in ("x-api-key", "api-key"):
+        for name in ("x-api-key", "api-key", "x-goog-api-key"):
             value = headers.get(name)
             if value:
                 candidates.append(value.strip())
+        candidates.extend(value.strip() for value in query_keys if value and value.strip())
         if not candidates:
             return False
         return any(
@@ -1360,6 +1367,18 @@ class DiscoveryRegistry:
 
     def models_payload(self) -> dict[str, Any]:
         return self._models_payload(self._registry)
+
+    def gemini_models_payload(self, page_size: str | None = None,
+                              page_token: str | None = None) -> dict[str, Any]:
+        """models.list: every public route as a Gemini Model resource."""
+        return gemini.models_page(self.models_payload()["data"], page_size, page_token)
+
+    def gemini_model_payload(self, name: str) -> dict[str, Any] | None:
+        """models.get for a listed route; unlisted (dynamic) names are not exposed."""
+        for entry in self.models_payload()["data"]:
+            if entry["id"] == name:
+                return gemini.model_resource(entry)
+        return None
 
     def muse_models_payload(self) -> dict[str, Any]:
         """Project the full cached inventory into Muse's Responses catalog."""
