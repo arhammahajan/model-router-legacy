@@ -22,6 +22,7 @@ from .common import (
     _thaw,
 )
 from .config import Provider, Route
+from .client_compat import prepare_chat
 from .count_tokens import count_tokens as _count_tokens
 from .constants import (
     DIALECT_ANTHROPIC,
@@ -187,6 +188,8 @@ class App(DiscoveryRegistry):
         alt: str | None = None,
     ) -> Plan:
         _validate_ingress(ingress, payload, translated=ingress != route.dialect)
+        if self.config.bearer_session_compat and ingress == DIALECT_OPENAI_CHAT:
+            payload, inbound_headers = prepare_chat(payload, inbound_headers)
         provider = route._provider or self.provider(route.provider_name)
         session_id = _session_id(provider, payload, inbound_headers)
         if ingress == route.dialect:

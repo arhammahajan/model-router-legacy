@@ -14,6 +14,7 @@ port = 4000
 # auth_mode = "required" and api_keys = ["${MODEL_ROUTER_API_KEY}"].
 # Missing/empty substitutions fail startup; "none" ignores auth env variables.
 auth_mode = "none"
+bearer_session_compat = true
 # Only reviewed explicit/catalog/discovered routes; no provider/model bypass.
 allow_dynamic_routes = false
 max_body_bytes = 67108864

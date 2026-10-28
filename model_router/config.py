@@ -389,6 +389,7 @@ class Config:
     body_read_timeout: float = DEFAULT_BODY_READ_TIMEOUT
     write_timeout: float = DEFAULT_WRITE_TIMEOUT
     capability_overrides: Mapping[str, Mapping[str, Any]] = field(default_factory=dict)
+    bearer_session_compat: bool = False
     allow_dynamic_routes: bool = True
     retry: RetryPolicy = field(default_factory=RetryPolicy)
     discovery_cache: DiscoveryCacheConfig | None = None
@@ -402,6 +403,10 @@ class Config:
         self.capability_overrides = _freeze(self.capability_overrides)
         if type(self.allow_dynamic_routes) is not bool:
             raise SystemExit("server.allow_dynamic_routes must be boolean")
+        if type(self.bearer_session_compat) is not bool:
+            raise SystemExit("server.bearer_session_compat must be boolean")
+        if self.bearer_session_compat and self.api_keys:
+            raise SystemExit("server.bearer_session_compat requires unauthenticated client access")
         _llama_provider_names(self)
         for name in ("max_connections", "max_generations"):
             value = getattr(self, name)
@@ -840,6 +845,7 @@ def build_config(raw: Mapping[str, Any]) -> Config:
         "max_body_bytes": (int,), "max_connections": (int,), "max_generations": (int,),
         "header_read_timeout": (int, float), "body_read_timeout": (int, float),
         "write_timeout": (int, float), "allow_dynamic_routes": (bool,),
+        "bearer_session_compat": (bool,),
     }, "server")
     if not isinstance(server_raw, Mapping):
         raise SystemExit("server: must be a table/object")
@@ -1079,6 +1085,7 @@ def build_config(raw: Mapping[str, Any]) -> Config:
         llama_cpp=llama_cpp,
         capability_overrides=capability_overrides,
         allow_dynamic_routes=server_raw.get("allow_dynamic_routes", True),
+        bearer_session_compat=server_raw.get("bearer_session_compat", False),
         retry=retry,
         discovery_cache=discovery_cache,
         **{name: server_raw.get(name, default) for name, default in (

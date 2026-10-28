@@ -117,6 +117,17 @@ then these client-owned headers in order: `x-claude-code-session-id`, `session-i
 reorder that set. `session_prompt_cache_key = true` enables a final body fallback.
 No identity is derived from credentials or prompt text.
 
+For clients that only support bearer authentication, an unauthenticated local
+router can opt into `[server] bearer_session_compat = true` (default: false).
+A Chat request bearing the public token `router-session-<UUIDv4>` uses that
+client-generated value as fallback session identity and combines consecutive
+leading plain-text system messages, preserving their order. Explicit native
+session headers take priority. Other bearer values and unmarked requests are
+unchanged. This option cannot be combined with client API keys; these tokens
+are public affinity values, never credentials. fx and Cline launchers generate
+a fresh value per invocation. Chat streaming and `/v1/models` use the main
+router directly without a separate compatibility service.
+
 The MCode header was verified on 2026-10-27 against installed MCode 0.6.13's
 `LocalModelResolver`: it sets `X-Mavis-Session-Id` from the durable session ID
 for custom providers. Pi's integration sends its durable session ID as
