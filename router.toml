@@ -118,7 +118,7 @@ session_missing = "omit"
 headers = { "User-Agent" = "litellm-model-router/0.3.0" }
 timeout = 600
 
-# Local llama.cpp / llama-swap servers are discovered automatically. Models
+# Local llama.cpp / llama-swap / Strata servers are discovered automatically. Models
 # appear in /v1/models alongside the OpenCode catalog, with their context size
 # and aliases. LLAMA_SERVER_URL overrides the server list. Delete this section
 # to turn discovery off.

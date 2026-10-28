@@ -1,6 +1,8 @@
 // Auto-discovers models from a local litellm-model-router and registers them
 // as the "model-router" provider. Replaces a hand-written models.json entry.
 //
+// Includes local llama.cpp and Strata engines discovered by the router.
+//
 //   MODEL_ROUTER_URL      router origin (default http://127.0.0.1:4000)
 //   MODEL_ROUTER_API_KEY  sent as the API key when the router requires one
 //
@@ -46,17 +48,19 @@ async function discover(signal?: AbortSignal): Promise<any[]> {
     const caps = md.router ?? {};
     const dialect: string = md.dialect ?? "openai-chat";
     const isLlama = !!md.llama_cpp;
+    const isStrata = md.engine === "strata";
+    const name = m.display_name ?? md.display_name ?? (isLlama && !isStrata ? `${m.id} (llama.cpp)` : m.id);
 
     const model: any = {
       id: m.id,
-      name: m.display_name ?? md.display_name ?? (isLlama ? `${m.id} (llama.cpp)` : m.id),
-      // The router advertises effort support for llama.cpp, where it maps the
-      // levels server-side.
+      name: isStrata && !/\(strata\)$/i.test(name) ? `${name} (Strata)` : name,
+      // Local engines advertise effort controls independently of whether the
+      // model reports that it produces reasoning.
       reasoning:
         val(caps.reasoning?.supported) === true || val(caps.reasoning?.effort?.supported) === true,
       input: val(caps.modalities?.input?.image) ? ["text", "image"] : ["text"],
       cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-      // llama.cpp reports these at the top level; other upstreams only under
+      // Local engines report these at the top level; other upstreams only under
       // router.limits. null means unknown, so fall back to pi's defaults.
       contextWindow: md.context_window ?? val(caps.limits?.context_window) ?? 128000,
       maxTokens: md.max_tokens ?? val(caps.limits?.max_output_tokens) ?? 16384,

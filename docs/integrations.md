@@ -10,6 +10,17 @@ Muse needs no adapter: point it directly at the router's `/v1` base URL. `GET /m
 
 `integrations/pi/model-router.ts` registers the router's models as a pi provider, discovered at startup and on refresh. Each model uses its upstream's native protocol, so requests pass through untouched.
 
+Local llama.cpp and Strata/PolyStrata servers share the router's `[llama_cpp]`
+discovery configuration. List both URLs in `servers` to use both engines; the
+default `http://127.0.0.1:9931` also works for Strata. The router identifies
+Strata from `/props.build_info` and publishes `metadata.engine = "strata"`.
+Pi labels these models `(Strata)`, keeps their reported context size, and offers
+off/low/medium/high thinking. Strata receives native `reasoning_effort` values;
+llama.cpp continues to use the router's thinking-budget mapping. Canonical
+Strata levels were reviewed against PolyStrata 0.1.45's `serve/frontend.py`
+(`effort_kwargs`); aliases such as `minimal` (thinking off) are not offered as
+separate levels.
+
 Install by symlinking, so edits take effect:
 
 ```bash
@@ -21,7 +32,7 @@ ln -s "$PWD/integrations/pi/model-router.ts" ~/.pi/agent/extensions/model-router
 | `MODEL_ROUTER_URL` | `http://127.0.0.1:4000` | Router origin |
 | `MODEL_ROUTER_API_KEY` | none | API key, if the router requires one |
 
-It reads `metadata.dialect`, `metadata.llama_cpp`, `metadata.context_window` and `metadata.max_tokens` (llama.cpp), and under `metadata.router`: `limits`, `modalities.input.image`, `reasoning.supported`, `reasoning.effort.supported` and `reasoning.effort.values`. Unknown limits fall back to pi's defaults (128000 context, 16384 output).
+It reads `metadata.dialect`, `metadata.engine`, `metadata.llama_cpp`, `metadata.context_window` and `metadata.max_tokens` (local engines), and under `metadata.router`: `limits`, `modalities.input.image`, `reasoning.supported`, `reasoning.effort.supported` and `reasoning.effort.values`. Unknown limits fall back to pi's defaults (128000 context, 16384 output).
 
 What the extension still does, and why the router cannot do it instead:
 

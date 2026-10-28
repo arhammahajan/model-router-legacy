@@ -1,6 +1,6 @@
 # litellm-model-router
 
-A small HTTP router that accepts **OpenAI Chat**, **OpenAI Responses**, **Anthropic Messages** and **Gemini API** (`generateContent`) requests and forwards them to any upstream that speaks one of those protocols. Local **llama.cpp** servers are discovered automatically.
+A small HTTP router that accepts **OpenAI Chat**, **OpenAI Responses**, **Anthropic Messages** and **Gemini API** (`generateContent`) requests and forwards them to any upstream that speaks one of those protocols. Local **llama.cpp** and **Strata** servers are discovered automatically.
 
 ```
    /v1/chat/completions ─────┐                 ┌─ openai-chat
@@ -133,7 +133,7 @@ A config file is TOML. Strings support `${ENV_VAR}`; missing variables are error
 | `[providers.NAME]` | An upstream: `dialect`, `base_url`, `api_key`, optional headers and timeout |
 | `[[models]]` | An explicit route from a public model name to a provider |
 | `[catalog]` | Pull a model list from a remote endpoint and map each model to a provider |
-| `[llama_cpp]` | Discover local llama.cpp servers |
+| `[llama_cpp]` | Discover local llama.cpp and Strata servers |
 | `[retry]` | Off by default; opt in with `max_attempts` |
 | `[capabilities]` | Override reported model capabilities |
 | `[discovery_cache]` | Optional on-disk cache of discovered models |
@@ -147,7 +147,7 @@ model-router --check-readiness     # one discovery pass; exit 0 ready, 3 not rea
 
 ## llama.cpp
 
-Running servers are probed (default `http://127.0.0.1:9931`, or `LLAMA_SERVER_URL`), and every model they report is routed on its own, with aliases, context size and capabilities. Single-model, router-mode, `ik_llama.cpp` and [llama-swap](https://github.com/mostlygeek/llama-swap) servers are recognized. Servers started later are picked up on the next refresh.
+Running servers are probed (default `http://127.0.0.1:9931`, or `LLAMA_SERVER_URL`), and every model they report is routed on its own, with aliases, context size and capabilities. Single-model, router-mode, `ik_llama.cpp`, [llama-swap](https://github.com/mostlygeek/llama-swap), and Strata/PolyStrata servers are recognized. Servers started later are picked up on the next refresh.
 
 ```toml
 [llama_cpp]
@@ -155,6 +155,11 @@ servers = ["http://127.0.0.1:9931"]
 refresh_seconds = 30
 context_fallback = 128000     # used only when the server reports no context size
 ```
+
+Strata uses the same `[llama_cpp].servers` list and is identified from its
+`/props.build_info` report. It keeps native `reasoning_effort` controls
+(none/low/medium/high); the llama.cpp budget mapping below applies only to
+llama.cpp. The Pi extension labels discovered Strata models automatically.
 
 Each model's `metadata.limits` separates `context_window`, `trained_context_window`, `max_input_tokens`, `max_output_tokens` and `default_output_tokens`. Every field carries its value, source and kind (`reported`, `override`, `inferred`, `fallback` or `unknown`). Pin a value with `[llama_cpp.limit_overrides."model-id"]`. If a server goes down, its last known routes stay and `/diagnostics` reports it as stale.
 

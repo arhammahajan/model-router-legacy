@@ -165,9 +165,10 @@ api_key = "ollama"
 #
 # Every server is probed once before listening, then in the background. Models, aliases,
 # context size and capabilities are read from /health, /v1/models and /props.
-# Single-model, router (--models-preset), legacy (ik_llama.cpp) and llama-swap
-# servers are all recognized. Discovered models become ordinary routes on
-# llama.cpp's OpenAI Chat endpoint, and are translated for other ingresses.
+# Single-model, router (--models-preset), legacy (ik_llama.cpp), llama-swap,
+# and Strata/PolyStrata servers are recognized. Strata is identified by its
+# /props build_info and keeps native reasoning_effort controls. Discovered
+# models use OpenAI Chat, and are translated for other ingresses.
 # Provider identities are reserved before probing, including unavailable servers.
 # Explicit names must be unique across servers and static providers. Generated
 # URL names use -2, -3, etc. on collision in config order, independent of health.

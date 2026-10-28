@@ -23,6 +23,9 @@ SAMPLING = (
 # model_router._apply_llama_thinking. "max" is absent: llama.cpp has no maximum
 # level, so a translated request for it is reported instead of sending nothing.
 LLAMA_EFFORT_VALUES = ("none", "minimal", "low", "medium", "high", "xhigh")
+# Canonical native levels in PolyStrata's serve/frontend.py effort_kwargs
+# (reviewed against 0.1.45). Other accepted spellings are aliases, not levels.
+STRATA_EFFORT_VALUES = ("none", "low", "medium", "high")
 LIMITS = ("context_window","trained_context_window", "max_input_tokens",
           "max_output_tokens", "default_output_tokens")
 
@@ -263,8 +266,18 @@ def go(model: str, dialect: str) -> dict[str, Any]:
     return result
 
 
+def local_engine(props: Any) -> str:
+    """Identify Strata from its /props build report, never from a model name."""
+    build = props.get("build_info") if isinstance(props, Mapping) else None
+    name = build.split(maxsplit=1)[0].lower() if isinstance(build, str) and build.strip() else ""
+    if name in ("strata", "polystrata"):
+        return "strata"
+    return "llama.cpp"
+
+
 def llama(row: Mapping[str, Any], props: Any, mode: str, limits: Mapping[str, Any],
-          retrieved_at: float, *, per_model_props: bool = False) -> dict[str, Any]:
+          retrieved_at: float, *, per_model_props: bool = False,
+          engine: str = "llama.cpp") -> dict[str, Any]:
     result = empty("openai-chat")
     result["limits"] = copy.deepcopy(dict(limits))
     source = "llama.props"
@@ -316,15 +329,25 @@ def llama(row: Mapping[str, Any], props: Any, mode: str, limits: Mapping[str, An
         # No effort enum, toggle, budget, or default follows from this boolean.
         # supports_preserve_reasoning concerns history, not a thinking toggle.
 
-    # Independent of the chat template: the router maps OpenAI reasoning effort
-    # onto llama.cpp's native thinking_budget_tokens/enable_thinking fields. This
-    # states the control exists, not that a given model produces thinking.
-    source_name = "router.llama_thinking_map"
-    report("reasoning.effort.supported", True, "supported", source_name, "configured")
-    report("reasoning.effort.values", list(LLAMA_EFFORT_VALUES), "values", source_name, "configured")
+    # Independent of the chat template: llama.cpp uses the router's budget map;
+    # Strata accepts native effort levels. Neither proves a model produces thinking.
+    strata = engine == "strata"
+    source_name = "strata.compat" if strata else "router.llama_thinking_map"
+    kind = "inferred" if strata else "configured"
+    report("reasoning.effort.supported", True, "supported", source_name, kind)
+    report("reasoning.effort.values", list(STRATA_EFFORT_VALUES if strata else LLAMA_EFFORT_VALUES),
+           "values", source_name, kind)
     report("reasoning.effort.native_parameter", {"protocol": "openai-chat", "path": "reasoning_effort"},
-           "native_parameter", source_name, "configured")
-    result["sources"][source_name] = {"verification": "router request mapping, not an upstream report"}
+           "native_parameter", source_name, kind)
+    result["sources"][source_name] = {
+        "verification": ("PolyStrata 0.1.45 serve/frontend.py effort_kwargs; identified by /props.build_info"
+                         if strata else "router request mapping, not an upstream report"),
+    }
+    if strata:
+        report("reasoning.toggle.supported", True, "none", source_name, kind)
+        report("reasoning.toggle.native_parameter", {
+            "protocol": "openai-chat", "path": "reasoning_effort", "values": {"off": "none"},
+        }, "none", source_name, kind)
 
     defaults = props.get("default_generation_settings")
     if isinstance(defaults, Mapping):

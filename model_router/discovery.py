@@ -361,7 +361,7 @@ def _cache_contract(raw: Mapping[str, Any], dialect: str, sanitize: ErrorSanitiz
     sources = raw.get("sources", {})
     if not isinstance(sources, Mapping):
         raise ValueError("invalid cached provenance")
-    for name in ("catalog", "go.review", "llama.models", "llama.props"):
+    for name in ("catalog", "go.review", "llama.models", "llama.props", "strata.compat"):
         if name not in sources:
             continue
         source = sources[name]
@@ -378,6 +378,8 @@ def _cache_contract(raw: Mapping[str, Any], dialect: str, sanitize: ErrorSanitiz
 
 def _cache_metadata(raw: Mapping[str, Any], sanitize: ErrorSanitizer) -> dict[str, Any]:
     result: dict[str, Any] = {}
+    if raw.get("engine") in ("llama.cpp", "strata"):
+        result["engine"] = raw["engine"]
     for key in (*LLAMA_LIMIT_FIELDS, "max_tokens"):
         value = raw.get(key)
         if key in raw and (value is None or type(value) is int and value >= 0):
@@ -481,7 +483,7 @@ class DiscoveryRegistry:
             self.close()
             raise
 
-    def _llama_provider(self, server: LlamaCppServer) -> Provider:
+    def _llama_provider(self, server: LlamaCppServer, *, engine: str = "llama.cpp") -> Provider:
         llama = self.config.llama_cpp
         assert llama is not None
         return Provider(
@@ -490,7 +492,7 @@ class DiscoveryRegistry:
             headers={**llama.headers, **server.headers}, timeout=DEFAULT_TIMEOUT,
             litellm_provider="openai", litellm_kwargs={},
             drop_params=llama.compatibility == "lossy",
-            llama_cpp=True,
+            llama_cpp=engine != "strata",
         )
 
     def _cached_route(self, row: Any, provider: Provider, prefix: str = "") -> Route:
@@ -574,7 +576,11 @@ class DiscoveryRegistry:
                 at = timestamp(unit)
                 if at is None:
                     continue
-                provider = self._llama_provider(server)
+                engines = {_cache_metadata(row["metadata"], self._cache_sanitize).get("engine", "llama.cpp")
+                           for row in unit["models"]}
+                if len(engines) > 1:
+                    raise ValueError("inconsistent cached local engines")
+                provider = self._llama_provider(server, engine=next(iter(engines), "llama.cpp"))
                 server_routes, server_public = {}, []
                 for row in unit["models"]:
                     route = self._cached_route(row, provider, llama.prefix)
@@ -1164,8 +1170,9 @@ class DiscoveryRegistry:
             rows = outcome["rows"]
             props = outcome["props"]
             mode = _llama_mode(props, rows)
+            engine = router_metadata.local_engine(props)
             provider_name = self._llama_names[server.url]
-            provider = self._llama_provider(server)
+            provider = self._llama_provider(server, engine=engine)
             providers[provider_name] = provider
             server_routes: dict[str, Route] = {}
             server_public: list[Route] = []
@@ -1177,7 +1184,7 @@ class DiscoveryRegistry:
                     continue
                 model_id = model_id.strip()
                 aliases = _llama_model_aliases(row)
-                display_name = "Local (llama.cpp)" if model_id == "local" else (aliases[0] if aliases else model_id)
+                display_name = f"Local ({engine})" if model_id == "local" else (aliases[0] if aliases else model_id)
                 model_props = outcome.get("model_props", {})
                 per_model_props = model_id in model_props
                 limits = _llama_limits(
@@ -1201,6 +1208,7 @@ class DiscoveryRegistry:
                 )
                 metadata.update(
                     {
+                        "engine": engine,
                         "display_name": display_name,
                         "context_window": context,
                         # Compatibility alias: maximum generation length only.
@@ -1233,7 +1241,7 @@ class DiscoveryRegistry:
                     metadata=metadata,
                     _capabilities=router_metadata.llama(
                         row, model_props[model_id] if per_model_props else props,
-                        mode, limits, time.time(), per_model_props=per_model_props,
+                        mode, limits, time.time(), per_model_props=per_model_props, engine=engine,
                     ),
                 )
                 server_routes[public_name] = route

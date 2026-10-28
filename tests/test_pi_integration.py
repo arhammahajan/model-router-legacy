@@ -18,7 +18,7 @@ import httpx
 import pytest
 
 from test_model_router import (
-    _config, _with_gemini, llama_server, router_config, upstream,  # noqa: F401  (fixtures)
+    FakeLlamaServer, _config, _with_gemini, llama_server, router_config, upstream,  # noqa: F401  (fixtures)
 )
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -53,7 +53,7 @@ CHAT_FACTS = {"reasoning": {"supported": True, "effort": {
 UNPUBLISHED_FACTS = {"reasoning": {"supported": True}}
 
 
-def _run(upstream, *, policy="strict", llama=None):
+def _run(upstream, *, policy="strict", llama=None, strata=None):
     raw = _with_gemini(_config(upstream), upstream)
     # gemini-4-argon is newer than Gemini 2: the adapter sends a native thinking level.
     raw["models"].append({"name": "m-gem3", "provider": "gem", "model": "gemini-4-argon"})
@@ -64,8 +64,9 @@ def _run(upstream, *, policy="strict", llama=None):
         "m-gem3": LEVEL_FACTS, "m-gem": UNPUBLISHED_FACTS, "m-chat": CHAT_FACTS,
         "m-anth": {"reasoning": {"supported": True, "toggle": {"supported": True}}},
     }}
-    if llama is not None:
-        raw["llama_cpp"] = {"servers": [llama.url], "timeout": 1.0, "refresh_seconds": 0,
+    if llama is not None or strata is not None:
+        raw["llama_cpp"] = {"servers": [s.url for s in (llama, strata) if s is not None],
+                            "timeout": 1.0, "refresh_seconds": 0,
                             "compatibility": policy}
     with router_config(raw) as base:
         env = {**os.environ, "MODEL_ROUTER_URL": base, "MODEL_ROUTER_API_KEY": "unused"}
@@ -145,6 +146,33 @@ def test_llama_levels_pi_offers_are_all_ones_the_router_implements(llama_server,
     wire = [req["body"] for req in llama_server.requests if req["path"] == "/v1/chat/completions"]
     assert {"enable_thinking": False} in [b.get("chat_template_kwargs") for b in wire]
     assert 32768 in [b.get("thinking_budget_tokens") for b in wire]
+
+
+def test_pi_discovers_strata_alongside_llama_and_sends_native_efforts(llama_server, upstream):
+    strata = FakeLlamaServer(models=[{
+        "id": "strata-test", "meta": {"n_ctx": 131072},
+        "architecture": {"input_modalities": ["text"]}, "status": {"value": "loaded"},
+    }], props={"build_info": "PolyStrata 0.1.45", "modalities": {"vision": False}}).start()
+    try:
+        models, records = _run(upstream, llama=llama_server, strata=strata)
+        model = models["strata-test"]
+        assert model["name"] == "strata-test (Strata)"
+        assert model["contextWindow"] == 131072
+        assert model["maxTokens"] == 16384
+        assert model["thinkingLevelMap"] == {"minimal": None, "off": "none"}
+        sent = [r for r in records if r["model"] == "strata-test"]
+        assert {r["level"] for r in sent} == {"off", "low", "medium", "high"}
+        assert all(r["status"] == 200 and r["loss"] is None for r in sent), sent
+        wire = [req["body"] for req in strata.requests if req["path"] == "/v1/chat/completions"]
+        assert {b["reasoning_effort"] for b in wire} == {"none", "low", "medium", "high"}
+        assert all("thinking_budget_tokens" not in b for b in wire)
+        assert "llama-test" in models
+        assert "xhigh" in models["llama-test"]["thinkingLevelMap"]
+        llama_wire = [req["body"] for req in llama_server.requests
+                      if req["path"] == "/v1/chat/completions"]
+        assert 32768 in [b.get("thinking_budget_tokens") for b in llama_wire]
+    finally:
+        strata.stop()
 
 
 @pytest.mark.parametrize("model", ["m-chat", "m-anth", "m-resp", "m-gem3"])
