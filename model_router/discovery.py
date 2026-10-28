@@ -1176,7 +1176,7 @@ class DiscoveryRegistry:
                     continue
                 model_id = model_id.strip()
                 aliases = _llama_model_aliases(row)
-                display_name = aliases[0] if aliases else model_id
+                display_name = "Local (llama.cpp)" if model_id == "local" else (aliases[0] if aliases else model_id)
                 model_props = outcome.get("model_props", {})
                 per_model_props = model_id in model_props
                 limits = _llama_limits(
@@ -1217,7 +1217,7 @@ class DiscoveryRegistry:
                 )
                 for key in LLAMA_LIMIT_FIELDS:
                     metadata[key] = limits[key]["value"]
-                public_name = llama.prefix + model_id
+                public_name = llama.prefix + ("local-llama" if model_id == "local" else model_id)
                 if (
                     public_name in explicit_names
                     or public_name in routes
