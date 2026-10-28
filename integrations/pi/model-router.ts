@@ -49,7 +49,7 @@ async function discover(signal?: AbortSignal): Promise<any[]> {
 
     const model: any = {
       id: m.id,
-      name: m.id === "local-llama" && isLlama ? "Local (llama.cpp)" : isLlama ? `${m.id} (llama.cpp)` : m.id,
+      name: m.display_name ?? md.display_name ?? (isLlama ? `${m.id} (llama.cpp)` : m.id),
       // The router advertises effort support for llama.cpp, where it maps the
       // levels server-side.
       reasoning:

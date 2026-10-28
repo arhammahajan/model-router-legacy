@@ -24,6 +24,7 @@ import httpx
 import router_metadata
 
 from . import gemini
+from .model_names import MODEL_DISPLAY_NAMES
 from .common import (
     ErrorSanitizer,
     RouterError,
@@ -1350,9 +1351,14 @@ class DiscoveryRegistry:
             "created": now,
             "created_at": now,
             "owned_by": route.provider_name,
-            "display_name": _thaw(route.metadata.get("display_name", route.name)),
+            "display_name": MODEL_DISPLAY_NAMES.get(
+                route.name, _thaw(route.metadata.get("display_name", route.name))
+            ),
             "metadata": {
                 **_thaw(route.metadata),
+                "display_name": MODEL_DISPLAY_NAMES.get(
+                    route.name, _thaw(route.metadata.get("display_name", route.name))
+                ),
                 "provider": route.provider_name,
                 "upstream_model": route.upstream_model,
                 "dialect": route.dialect,
