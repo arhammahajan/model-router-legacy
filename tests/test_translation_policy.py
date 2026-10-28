@@ -255,3 +255,25 @@ def test_chat_store_true_cannot_be_honored_by_a_destination_without_stored_compl
     else:
         (loss,) = json.loads(response.headers["x-model-router-loss"])
         assert loss["field"] == "store" and loss["action"] == "dropped"
+
+
+@pytest.mark.parametrize("lossy", [False, True])
+@pytest.mark.parametrize("stream", [False, True])
+def test_codex_client_metadata_stays_out_of_translated_adapter_context(upstream, lossy, stream):
+    raw = _config(upstream)
+    raw["providers"]["chat"]["compatibility"] = "lossy" if lossy else "strict"
+    body = {**_body("openai-responses", "m-chat", stream),
+            "client_metadata": {"session_id": "codex-session", "api_base": "untrusted"}}
+    with router_config(raw) as base:
+        response = httpx.post(base + "/v1/responses", json=body, timeout=30)
+    if lossy:
+        assert response.status_code == 200, response.text
+        assert "client_metadata" in {
+            loss["field"] for loss in json.loads(response.headers["x-model-router-loss"])
+        }
+        assert upstream.requests
+        assert "client_metadata" not in upstream.requests[0]["body"]
+        assert "untrusted" not in json.dumps(upstream.requests[0]["body"])
+    else:
+        assert response.status_code == 400
+        assert upstream.requests == []

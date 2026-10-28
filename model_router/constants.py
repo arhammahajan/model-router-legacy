@@ -145,7 +145,7 @@ _GENERATION_FIELDS = {
         "user", "verbosity", "web_search_options",
     }),
     DIALECT_OPENAI_RESPONSES: frozenset({
-        "background", "conversation", "include", "input", "instructions",
+        "background", "client_metadata", "conversation", "include", "input", "instructions",
         "max_output_tokens", "max_tool_calls", "parallel_tool_calls",
         "previous_response_id", "prompt", "prompt_cache_key",
         "prompt_cache_retention", "reasoning", "safety_identifier", "service_tier",
