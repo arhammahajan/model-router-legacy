@@ -19,6 +19,7 @@ from dataclasses import dataclass, field
 from typing import Any, Iterable, Iterator, Mapping
 from urllib.parse import unquote
 
+from .tools import decide_tool
 from .common import RouterError
 from .constants import (
     DIALECT_ANTHROPIC,
@@ -567,9 +568,10 @@ class _Translator:
                 if value is None:
                     continue
                 if key != "functionDeclarations":
-                    self.lose(f"tools[{ti}].{key}",
-                              f"native tool type '{key}' has no equivalent on this target "
-                              "and requires a native route")
+                    decision = decide_tool("gemini", self.target, key, f"tools[{ti}].{key}")
+                    loss = decision.loss()
+                    if loss is not None:
+                        self.losses.append(loss)
                     continue
                 for fi, raw_decl in enumerate(_typed(value, (list,), f"tools[{ti}].{key}")):
                     path = f"tools[{ti}].functionDeclarations[{fi}]"

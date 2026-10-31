@@ -1046,17 +1046,26 @@ def test_thinking_extension_uses_generation_mapping(upstream: FakeUpstream) -> N
 
 
 
-def test_translated_mcp_tool_does_not_execute_in_router(upstream: FakeUpstream) -> None:
+@pytest.mark.parametrize("compatibility", ["strict", "lossy"])
+def test_translated_mcp_tool_follows_policy_without_router_execution(upstream: FakeUpstream, compatibility: str) -> None:
     alternate = FakeUpstream().start()
     try:
         tool = {"type": "mcp", "server_label": "untrusted",
                 "server_url": f"http://127.0.0.1:{alternate.port}/mcp"}
-        with router(upstream) as base:
+        raw = _config(upstream)
+        raw["providers"]["resp"]["compatibility"] = compatibility
+        with router_config(raw) as base:
             response = httpx.post(base + "/v1/chat/completions", json={
                 **_body("openai-chat", "m-resp", False), "tools": [tool],
             }, timeout=30)
-        assert response.status_code == 200, response.text
-        assert upstream.last_request("/v1/responses")["body"]["tools"] == [tool]
+        if compatibility == "strict":
+            assert response.status_code == 400, response.text
+            assert response.json()["error"]["code"] == "translation_loss"
+            assert upstream.requests == []
+        else:
+            assert response.status_code == 200, response.text
+            assert "tools" not in upstream.last_request("/v1/responses")["body"]
+            assert json.loads(response.headers["x-model-router-loss"])[0]["field"] == "tools[0]"
         assert alternate.requests == []
     finally:
         alternate.stop()

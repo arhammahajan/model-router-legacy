@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import math
-import re
 from typing import Any, Mapping
 
 import router_metadata
@@ -19,6 +18,7 @@ from .constants import (
     DIALECT_OPENAI_RESPONSES,
 )
 from .reasoning import plan_reasoning
+from .tools import ToolPlan, plan_tools
 
 
 def _generation_error(field: str) -> RouterError:
@@ -256,96 +256,6 @@ def _clean_request_params(
     return params
 
 
-_SAFE_LABEL = re.compile(r"[A-Za-z0-9_.:-]{1,64}")
-
-
-def _label(value: Any) -> str:
-    # Tool types and names are client data; only echo plain identifiers.
-    return value if isinstance(value, str) and _SAFE_LABEL.fullmatch(value) else "unknown"
-
-
-def _function_name(tool: Mapping[str, Any], ingress: str) -> str | None:
-    """The function name when this tool is a translatable function, else None."""
-    kind = tool.get("type")
-    if ingress == DIALECT_ANTHROPIC:
-        # Typed Anthropic tools (bash_*, text_editor_*, web_search_*, ...) are
-        # provider-native; only plain/custom tools are JSON-schema functions.
-        name = tool.get("name") if kind in (None, "custom") else None
-    elif kind in (None, "function"):
-        spec = tool.get("function") if ingress == DIALECT_OPENAI_CHAT else tool
-        name = spec.get("name") if isinstance(spec, Mapping) else None
-    else:
-        name = None
-    return name if isinstance(name, str) else None
-
-
-def _choice_names(choice: Mapping[str, Any]) -> list[str | None] | None:
-    """Tool names a dict tool_choice refers to; None for choices that name no tool.
-
-    A None entry stands for a custom, hosted or unknown tool.
-    """
-    kind = choice.get("type")
-    if kind in (None, "auto", "none", "required", "any", "allowed_tools"):
-        # allowed_tools has no adapter mapping with or without native tools; not ours to rewrite.
-        return None
-    inner = choice.get("function") if isinstance(choice.get("function"), Mapping) else choice
-    if kind in ("function", "tool") and isinstance(inner.get("name"), str):
-        return [inner["name"]]
-    return [None]
-
-
-def _reconcile_tools(params: dict[str, Any], ingress: str) -> list[dict[str, str]]:
-    """Keep translatable function tools, remove each native one, fix tool_choice.
-
-    Returns one loss record per removed tool. tool_choice is only touched when
-    it would refer to a tool that was removed; parallel-tool controls are kept
-    while any function tool remains.
-    """
-    tools = params["tools"]
-    kept: list[Any] = []
-    names: set[str] = set()
-    losses: list[dict[str, str]] = []
-    for index, tool in enumerate(tools):
-        name = _function_name(tool, ingress) if isinstance(tool, Mapping) else None
-        if name is not None:
-            kept.append(tool)
-            names.add(name)
-            continue
-        kind = tool.get("type") if isinstance(tool, Mapping) else None
-        losses.append({"field": f"tools[{index}]", "action": "dropped",
-                       "reason": f"native tool type '{_label(kind)}' has no equivalent on this target "
-                                 "and requires a native route"})
-    if not losses:
-        return []
-
-    def lose_choice(reason: str, action: str = "dropped") -> None:
-        losses.append({"field": "tool_choice", "reason": reason, "action": action})
-
-    choice = params.get("tool_choice")
-    if not kept:
-        params.pop("tools")
-        for key in ("tool_choice", "parallel_tool_calls"):
-            if params.get(key) is not None:
-                params.pop(key)
-                losses.append({"field": key, "action": "dropped",
-                               "reason": "every tool definition was removed"})
-        return losses
-    params["tools"] = kept
-    if isinstance(choice, dict):
-        refs = _choice_names(choice)
-        if refs is None or all(ref in names for ref in refs):
-            return losses
-        if ingress == DIALECT_ANTHROPIC and "disable_parallel_tool_use" in choice:
-            # Keep the parallel constraint; a forced call to a removed tool cannot be honored.
-            params["tool_choice"] = {"type": "auto",
-                                     "disable_parallel_tool_use": choice["disable_parallel_tool_use"]}
-            lose_choice("forced tool was removed", "approximated")
-        else:
-            params.pop("tool_choice")
-            lose_choice("forced tool was removed")
-    return losses
-
-
 def _pop_path(params: dict[str, Any], path: str) -> None:
     node: Any = params
     parts = path.split(".")
@@ -403,7 +313,7 @@ def _prepare_gemini_translation(
 
 def _prepare_translation(
     provider: Provider, route: Route, ingress: str, payload: Mapping[str, Any],
-    contract: Mapping[str, Any], *, enforce: bool = True,
+    contract: Mapping[str, Any], *, enforce: bool = True, tool_plan: ToolPlan | None = None,
 ) -> tuple[dict[str, Any], list[dict[str, str]], dict[str, dict[str, Any]]]:
     """Conservative, body-only bridge contract; unknown model facts are neutral.
 
@@ -411,8 +321,10 @@ def _prepare_translation(
     model support. Fields outside the reviewed bridge surface cannot silently
     disappear, even when LiteLLM accepts them through **kwargs.
     """
-    params = _thaw(_clean_request_params(payload, ingress))
-    losses: list[dict[str, str]] = []
+    cleaned = _thaw(_clean_request_params(payload, ingress))
+    tool_plan = tool_plan or plan_tools(cleaned, ingress, route.dialect)
+    params = _thaw(tool_plan.request)
+    losses: list[dict[str, str]] = list(tool_plan.losses)
 
     def value(path: str) -> Any:
         node: Any = contract
@@ -492,17 +404,12 @@ def _prepare_translation(
             lose(key, "model capability is unsupported")
     if params.get("parallel_tool_calls") is True and value("tools.parallel") is False:
         lose("parallel_tool_calls", "model capability is unsupported")
-    # Provider-native tools have no equivalent on the target; function tools do.
-    # Reconcile them one by one so a single native tool never discards the rest.
-    if params.get("tools") and (route.dialect != DIALECT_OPENAI_RESPONSES
-                                or ingress == DIALECT_ANTHROPIC):
-        losses.extend(_reconcile_tools(params, ingress))
     if (params.get("tool_choice") is not None or params.get("parallel_tool_calls") is not None
             ) and not params.get("tools"):
         for key in ("tool_choice", "parallel_tool_calls"):
             if params.get(key) is not None:
                 lose(key, "bridge requires tools for this control")
-    if (ingress == DIALECT_ANTHROPIC and route.dialect == DIALECT_OPENAI_RESPONSES
+    if (ingress == DIALECT_ANTHROPIC and route.dialect != DIALECT_OPENAI_CHAT
             and isinstance(params.get("tool_choice"), dict)
             and "disable_parallel_tool_use" in params["tool_choice"]):
         lose("tool_choice.disable_parallel_tool_use", "parallel tool constraint has no bridge mapping")
@@ -521,6 +428,10 @@ def _prepare_translation(
         if params.get(key) == {}:
             del params[key]
     native = {"completion": reasoning_plan.completion, "body": reasoning_plan.body}
+    if params.get("tools"):
+        native["body"].update(tool_plan.body)
+    elif tool_plan.body:
+        lose("tool_choice", "bridge requires tools for this control")
 
     formats = [("response_format", params.get("response_format")),
                ("text.format", (params.get("text") or {}).get("format")),
@@ -593,7 +504,7 @@ def _prepare_translation(
     dropped = {item["field"] for item in losses if item["action"] == "dropped"}
     losses = [item for item in losses
               if not (item["action"] == "approximated"
-                      and any(item["field"] == path or item["field"].startswith(path + ".")
+                      and any(item["field"] == path or item["field"].startswith((path + ".", path + "["))
                               for path in dropped))]
 
     if enforce:

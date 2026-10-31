@@ -231,8 +231,14 @@ are dropped or approximated with `x-model-router-loss` diagnostics (see
 [Reasoning translation](#reasoning-translation)); native calls pass through unchanged. Custom configurations still default to strict translation.
 Model visibility does not guarantee every upstream-native feature exists in all
 protocols: stored Responses state and provider-native built-in tools remain
-protocol-specific. Ordinary function tools translate across the protocols,
-including Responses function namespaces.
+protocol-specific. Ordinary function tools translate across the protocols.
+OpenAI freeform custom tools can also translate through a string-valued function
+under lossy compatibility, with the original call and history shapes restored;
+Chat → Responses preserves their native contract. Function and custom-tool
+namespaces retain their identities. Strict compatibility refuses emulation,
+and grammar guarantees lost during emulation are always reported. See
+[Tool translation](docs/tool-translation.md) for supported mappings, streaming
+behavior and limits.
 
 ## Development
 

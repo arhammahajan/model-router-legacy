@@ -10,7 +10,7 @@ from typing import Any
 import httpx
 import pytest
 
-import model_router.protocol as router_protocol
+from model_router.tools import plan_tools
 from test_model_router import (
     PATHS, _anthropic_message, _chat_completion, _config, router_config, upstream,
 )
@@ -57,22 +57,22 @@ def sent_names(body: dict[str, Any]) -> list[str]:
 # --- mixed lists -----------------------------------------------------------------------------
 
 @pytest.mark.parametrize("model,path", TARGETS)
-def test_lossy_mixed_list_keeps_every_function_and_reports_each_native_tool(upstream, model, path):
+def test_lossy_mixed_list_keeps_functions_emulates_custom_and_reports_native_tools(upstream, model, path):
     body = responses_request(model, [LOOKUP, WEB, SEARCH, MCP, CUSTOM],
                              tool_choice="auto", parallel_tool_calls=False)
     response = post(raw_config(upstream, "lossy"), PATHS["openai-responses"], body)
     assert response.status_code == 200, response.text
     sent = upstream.last_request(path)["body"]
-    assert sent_names(sent) == ["lookup", "search"]
+    assert sent_names(sent) == ["lookup", "search", "patch"]
     # Function definitions are unchanged by the translation.
     schema = (sent["tools"][0].get("input_schema") or sent["tools"][0]["function"]["parameters"])
     assert schema["properties"] == SCHEMA["properties"]
     assert {(item["field"], item["action"]) for item in losses(response)} == {
-        ("tools[1]", "dropped"), ("tools[3]", "dropped"), ("tools[4]", "dropped")}
+        ("tools[1]", "dropped"), ("tools[3]", "dropped"), ("tools[4]", "approximated")}
     reasons = {item["field"]: item["reason"] for item in losses(response)}
     assert "'web_search'" in reasons["tools[1]"]
     assert "'mcp'" in reasons["tools[3]"]
-    assert "'custom'" in reasons["tools[4]"]
+    assert "custom tool input is emulated" in reasons["tools[4]"]
     # tool_choice stays valid; the parallel constraint survives because tools remain.
     if model == "m-chat":
         assert sent["tool_choice"] == "auto"
@@ -110,12 +110,12 @@ def test_namespace_with_function_and_native_child_keeps_the_function(upstream):
                  responses_request(CHAT[0], [namespace, SEARCH]))
     assert lossy.status_code == 200, lossy.text
     names = sent_names(upstream.last_request(CHAT[1])["body"])
-    assert len(names) == 2 and "search" in names and names[0].startswith("ns_")
-    assert [item["field"] for item in losses(lossy)] == ["tools[1]"]
+    assert len(names) == 3 and "search" in names and all(name.startswith("ns_") for name in names[:2])
+    assert [(item["field"], item["action"]) for item in losses(lossy)] == [("tools[0].tools[1]", "approximated")]
     upstream.requests.clear()
     strict = post(raw_config(upstream, "strict"), PATHS["openai-responses"],
                   responses_request(CHAT[0], [namespace, SEARCH]))
-    assert strict.status_code == 400 and "'custom'" in strict.json()["error"]["message"]
+    assert strict.status_code == 400 and "custom tool input is emulated" in strict.json()["error"]["message"]
     assert upstream.requests == []
 
 
@@ -171,13 +171,13 @@ def test_forced_function_choice_survives_native_tool_removal(upstream):
     assert [item["field"] for item in losses(response)] == ["tools[0]"]
 
 
-@pytest.mark.parametrize("choice", [{"type": "web_search"}, {"type": "custom", "name": "patch"}])
+@pytest.mark.parametrize("choice", [{"type": "web_search"}, {"type": "mcp", "server_label": "docs"}])
 def test_choice_forcing_a_removed_native_tool_is_dropped_and_reported(upstream, choice):
     body = responses_request(CHAT[0], [LOOKUP, WEB, CUSTOM], tool_choice=choice)
     response = post(raw_config(upstream, "lossy"), PATHS["openai-responses"], body)
     assert response.status_code == 200, response.text
     sent = upstream.last_request(CHAT[1])["body"]
-    assert sent_names(sent) == ["lookup"]
+    assert sent_names(sent) == ["lookup", "patch"]
     assert "tool_choice" not in sent
     assert {"field": "tool_choice", "reason": "forced tool was removed",
             "action": "dropped"} in losses(response)
@@ -194,6 +194,7 @@ def test_anthropic_forced_native_tool_keeps_the_parallel_constraint(upstream):
     sent = upstream.last_request(CHAT[1])["body"]
     assert sent_names(sent) == ["lookup"]
     assert sent["tool_choice"] == "auto"
+    assert sent["parallel_tool_calls"] is False
     assert {(item["field"], item["action"]) for item in losses(response)} == {
         ("tools[0]", "dropped"), ("tool_choice", "approximated")}
     upstream.requests.clear()
@@ -202,11 +203,10 @@ def test_anthropic_forced_native_tool_keeps_the_parallel_constraint(upstream):
 
 
 def test_reconcile_keeps_the_parallel_constraint_when_the_forced_tool_is_removed():
-    # The Anthropic->chat adapter does not forward disable_parallel_tool_use at all (a
-    # separate, pre-existing gap), so assert the router's own output directly.
+    # The decision preserves this constraint; the router applies its native Chat field.
     params = {"tools": [{"type": "bash_20250124", "name": "bash"}, {"name": "lookup"}],
               "tool_choice": {"type": "tool", "name": "bash", "disable_parallel_tool_use": True}}
-    router_protocol._reconcile_tools(params, "anthropic")
+    params = plan_tools(params, "anthropic", "openai-chat").request
     assert params["tools"] == [{"name": "lookup"}]
     assert params["tool_choice"] == {"type": "auto", "disable_parallel_tool_use": True}
 
@@ -220,7 +220,7 @@ def test_anthropic_custom_tools_are_functions_and_typed_tools_are_native(upstrea
     assert sent_names(upstream.last_request(CHAT[1])["body"]) == ["lookup"]
 
 
-def test_chat_custom_tool_is_native_for_an_anthropic_upstream(upstream):
+def test_chat_custom_tool_is_emulated_for_an_anthropic_upstream(upstream):
     fn = {"type": "function", "function": {"name": "lookup", "parameters": SCHEMA}}
     custom = {"type": "custom", "custom": {"name": "patch"}}
     response = post(raw_config(upstream, "lossy"), PATHS["openai-chat"], {
@@ -228,9 +228,9 @@ def test_chat_custom_tool_is_native_for_an_anthropic_upstream(upstream):
         "tools": [custom, fn], "tool_choice": {"type": "custom", "custom": {"name": "patch"}}})
     assert response.status_code == 200, response.text
     sent = upstream.last_request(ANTH[1])["body"]
-    assert sent_names(sent) == ["lookup"]
-    assert "tool_choice" not in sent
-    assert {item["field"] for item in losses(response)} == {"tools[0]", "tool_choice"}
+    assert sent_names(sent) == ["patch", "lookup"]
+    assert sent["tool_choice"] == {"type": "tool", "name": "patch"}
+    assert {(item["field"], item["action"]) for item in losses(response)} == {("tools[0]", "approximated")}
 
 
 # --- multi-turn round trips -------------------------------------------------------------------

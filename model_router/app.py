@@ -48,7 +48,7 @@ from .protocol import (
 )
 from .streams import Plan, StreamState, _chat_sse, _responses_sse, _translated_sse
 from .transport import _GenerationTransport, _RequestBudget
-from .tool_namespaces import flatten_namespaces, restore_namespaces
+from .tools import ToolPlan, plan_tools
 
 
 def _upstream_error(status: int, data: bytes, ingress: str) -> RouterError:
@@ -209,9 +209,7 @@ class App(DiscoveryRegistry):
             # Explicit affinity metadata is consumed before protocol validation.
             # Native passthrough keeps the provider's original cache field.
             payload = {key: value for key, value in payload.items() if key != "prompt_cache_key"}
-        tool_names = {}
-        if ingress == DIALECT_OPENAI_RESPONSES:
-            payload, tool_names = flatten_namespaces(payload)
+        tool_plan = None
         contract = self._route_entry(route if route._provider else replace(route, _provider=provider),
                                      int(time.time()), self._registry)["metadata"]["router"]
         translation = None
@@ -225,7 +223,9 @@ class App(DiscoveryRegistry):
             params, losses, native = _prepare_gemini_translation(
                 provider, route, translation, contract)
         else:
-            params, losses, native = _prepare_translation(provider, route, ingress, payload, contract)
+            tool_plan = plan_tools(_clean_request_params(payload, ingress), ingress, route.dialect)
+            params, losses, native = _prepare_translation(
+                provider, route, ingress, payload, contract, tool_plan=tool_plan)
         provider = _translation_header_provider(provider, inbound_headers)
         transport = None
         kwargs = _thaw(provider.litellm_kwargs)
@@ -234,9 +234,9 @@ class App(DiscoveryRegistry):
         provider = replace(provider, litellm_kwargs=kwargs)
         try:
             if ingress == DIALECT_OPENAI_CHAT:
-                plan = self._from_openai_chat(provider, route, params, session_id, native)
+                plan = self._from_openai_chat(provider, route, params, session_id, native, tool_plan)
             elif ingress == DIALECT_OPENAI_RESPONSES:
-                plan = self._from_openai_responses(provider, route, params, session_id, tool_names, native)
+                plan = self._from_openai_responses(provider, route, params, session_id, tool_plan, native)
             elif translation is not None:
                 plan = self._from_gemini(provider, route, params, session_id, native,
                                          translation, alt)
@@ -363,16 +363,18 @@ class App(DiscoveryRegistry):
         payload: dict[str, Any],
         session_id: str | None = None,
         native: Mapping[str, Mapping[str, Any]] | None = None,
+        tools: ToolPlan | None = None,
     ) -> Plan:
         result, stream = self._chat_completion(provider, route, payload, session_id, native)
         if stream:
             state = StreamState()
             return Plan(
                 content_type="text/event-stream",
-                chunks=_chat_sse(result, self.sanitize, state),
+                chunks=_chat_sse(tools.chat_stream(result) if tools else result, self.sanitize, state),
                 resources=(result,), stream_state=state,
             )
-        return Plan(body=_json_bytes(_sanitize_generated_errors(_jsonable(result), self.sanitize)))
+        data = tools.response(result) if tools else _jsonable(result)
+        return Plan(body=_json_bytes(_sanitize_generated_errors(data, self.sanitize)))
 
     def _from_gemini(
         self,
@@ -406,7 +408,7 @@ class App(DiscoveryRegistry):
         route: Route,
         payload: dict[str, Any],
         session_id: str | None = None,
-        tool_names: dict[str, tuple[str, str]] | None = None,
+        tools: ToolPlan | None = None,
         native: Mapping[str, Mapping[str, Any]] | None = None,
     ) -> Plan:
         params = _clean_request_params(payload, DIALECT_OPENAI_RESPONSES)
@@ -421,13 +423,13 @@ class App(DiscoveryRegistry):
         result = adapter.responses(**call_kwargs)
 
         def restore(value: Any) -> Any:
-            return restore_namespaces(_jsonable(value), tool_names or {})
+            return tools.response(value) if tools else _jsonable(value)
 
         if stream:
             state = StreamState()
             return Plan(
                 content_type="text/event-stream",
-                chunks=_responses_sse((restore(event) for event in result), self.sanitize, state),
+                chunks=_responses_sse(tools.responses_stream(result) if tools else result, self.sanitize, state),
                 resources=(result,), stream_state=state,
             )
         return Plan(body=_json_bytes(_sanitize_generated_errors(restore(result), self.sanitize)))
@@ -477,6 +479,10 @@ class App(DiscoveryRegistry):
         completion_params = {
             key: value for key, value in completion_params.items() if value is not None
         }
+        choice = payload.get("tool_choice")
+        if (route.dialect == DIALECT_OPENAI_CHAT and isinstance(choice, dict)
+                and type(choice.get("disable_parallel_tool_use")) is bool):
+            completion_params["parallel_tool_calls"] = not choice["disable_parallel_tool_use"]
         # The adapter copies untranslated fields into its result. Revalidate its
         # output as well so a new adapter merge cannot expand this boundary.
         adapter_extensions = {
