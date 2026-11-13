@@ -85,7 +85,7 @@ client.models.generate_content(model="claude-haiku-5-5", contents="Hi")
 - **Paths and names.** `/v1beta/models/{model}:generateContent` and `:streamGenerateContent`, as the SDKs call them. A `models/` prefix is optional, `provider/model` names may be sent with an unescaped or percent-encoded `/`, and `/v1/...` or an unversioned path also work. `tunedModels/...`, `countTokens`, `embedContent` and other methods are not implemented (404/501 in Gemini's error shape). Discovery is `GET /v1beta/models` (`pageSize`, `pageToken`) and `GET /v1beta/models/{model}`; token limits are reported only when known. `GET /v1/models` keeps its OpenAI/Anthropic shape.
 - **Same-protocol routes** (`dialect = "gemini"`) are forwarded as JSON: the body is untouched, the model and streaming mode move into the upstream URL, and an `alt=sse` selector is the only query parameter forwarded. Upstream errors keep their status and Google error status name.
 - **Other routes** translate through the Chat Completions bridge and answer with `GenerateContentResponse` / SSE frames (`data: {...}`, no terminator; function calls are delivered whole; `usageMetadata` and `finishReason` arrive on the final frame). Requests may use camelCase or snake_case, as on the public API. Unknown request fields are rejected.
-- **Authentication.** The router's own `api_keys` are accepted as `x-goog-api-key`, `?key=`, `Authorization: Bearer` or `x-api-key`, and failures are Gemini `UNAUTHENTICATED` errors. A client key is never forwarded: the upstream credential always comes from the provider config, `key=` never reaches an upstream URL or a log, and `x-goog-user-project` / `x-goog-quota-user` are dropped. This is API-key access to the Gemini *Developer API* surface only. It does not speak Google OAuth, Vertex AI paths or Antigravity's account-based protocol, so Antigravity cannot be moved onto it by supplying an API key.
+- **Authentication.** The router's own `api_keys` are accepted as `x-goog-api-key`, `?key=`, `Authorization: Bearer` or `x-api-key`, and failures are Gemini `UNAUTHENTICATED` errors. A client key is never forwarded: the upstream credential always comes from the provider config, `key=` never reaches an upstream URL or a log, and `x-goog-user-project` / `x-goog-quota-user` are dropped. This is API-key access to the Gemini *Developer API* surface only. Antigravity CLI's Gemini API-key mode and its ACP adapter's gateway mode can connect directly using the session compatibility below. Google OAuth, Vertex AI paths, and Antigravity's account-based protocol remain unsupported.
 
 What translation does with Gemini features (strict providers refuse anything in the *reported* column; lossy providers apply it and send the `x-model-router-loss` header):
 
@@ -115,7 +115,7 @@ then these client-owned headers in order: `x-claude-code-session-id`, `session-i
 `session_id`, `thread-id`, `conversation_id`, `x-session-id`, and
 `x-mavis-session-id`. A configured `session_source_headers` list can narrow or
 reorder that set. `session_prompt_cache_key = true` enables a final body fallback.
-No identity is derived from credentials or prompt text.
+Ordinary credentials and prompt text are never used to infer identity.
 
 For clients that only support bearer authentication, an unauthenticated local
 router can opt into `[server] bearer_session_compat = true` (default: false).
@@ -127,6 +127,33 @@ unchanged. This option cannot be combined with client API keys; these tokens
 are public affinity values, never credentials. fx and Cline launchers generate
 a fresh value per invocation. Chat streaming and `/v1/models` use the main
 router directly without a separate compatibility service.
+
+The same opt-in setting also supports direct Antigravity/Gemini connections:
+
+- Gemini requests accept the public `router-session-<UUIDv4>` token in
+  `x-goog-api-key`, `x-api-key`, `Authorization: Bearer`, or `?key=` as fallback
+  identity. Conflicting public tokens are rejected. Ordinary API keys do not
+  become session identities, and upstream credentials still come from provider
+  configuration. A launcher can set `GEMINI_API_KEY` to a fresh public token and
+  point `GOOGLE_GEMINI_BASE_URL` directly at the router.
+- Antigravity ACP's top-level `sessionId` string is consumed before native
+  forwarding or translation. Its identity is `agy-acp-` followed by SHA-256 of
+  the JSON-encoded string, preserving the former proxy's identity mapping.
+  A missing, null, or empty `sessionId` falls back to the launch token; other
+  value types are rejected. The launcher supplies that token through
+  `AGY_LLM_GATEWAY_API_KEY` and points `AGY_LLM_GATEWAY_URL` at the router.
+- Explicit native session headers take priority, then ACP's gateway session ID,
+  then the public launch token. Existing provider missing-session policy still
+  applies. Native Gemini, translated requests, SSE, and JSON-array streaming
+  use the main router with no per-process HTTP proxy.
+
+The installed Antigravity ACP adapter can reuse its gateway `sessionId` across
+multiple ACP conversations in one process. The router preserves the identity
+the client supplies; it does not infer a different conversation ID from prompts.
+
+With `bearer_session_compat` disabled, Gemini payloads and token handling retain
+their existing behavior. Enabling it still requires unauthenticated client
+access; public affinity tokens do not authenticate a client.
 
 The MCode header was verified on 2026-10-27 against installed MCode 0.6.13's
 `LocalModelResolver`: it sets `X-Mavis-Session-Id` from the durable session ID

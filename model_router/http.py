@@ -465,7 +465,8 @@ class Handler(BaseHTTPRequestHandler):
 
             plan = (self.app.dispatch(ingress, route, payload, self.headers, count_tokens=True)
                     if counting else
-                    self.app.dispatch(ingress, route, payload, self.headers, alt=alt)
+                    self.app.dispatch(ingress, route, payload, self.headers, alt=alt,
+                                      query_keys=query.get("key", ()))
                     if call is not None else
                     self.app.dispatch(ingress, route, payload, self.headers))
             self._send_plan(plan, ingress)

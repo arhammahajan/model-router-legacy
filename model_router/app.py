@@ -6,7 +6,7 @@ import json
 import time
 from dataclasses import replace
 from itertools import chain
-from typing import Any, AsyncIterator, Iterator, Mapping
+from typing import Any, AsyncIterator, Iterator, Mapping, Sequence
 
 import httpx
 
@@ -22,7 +22,7 @@ from .common import (
     _thaw,
 )
 from .config import Provider, Route
-from .client_compat import prepare_chat
+from .client_compat import prepare_chat, prepare_gemini
 from .count_tokens import count_tokens as _count_tokens
 from .constants import (
     DIALECT_ANTHROPIC,
@@ -83,6 +83,7 @@ class App(DiscoveryRegistry):
         *,
         count_tokens: bool = False,
         alt: str | None = None,
+        query_keys: Sequence[str] = (),
     ) -> Plan:
         # A token count shares the generation transport's deadline, retry policy
         # and proxy/redirect rules but never reaches a generation path.
@@ -99,7 +100,8 @@ class App(DiscoveryRegistry):
                 plan = _count_tokens(route, provider, payload, inbound_headers, client,
                                      self.sanitize)
             else:
-                plan = self._dispatch(ingress, route, payload, inbound_headers, client, alt)
+                plan = self._dispatch(ingress, route, payload, inbound_headers, client, alt,
+                                      query_keys)
             budget.timeout()
         except BaseException as exc:
             if plan is not None:
@@ -186,12 +188,16 @@ class App(DiscoveryRegistry):
         self, ingress: str, route: Route, payload: dict[str, Any],
         inbound_headers: Mapping[str, str], client: httpx.Client,
         alt: str | None = None,
+        query_keys: Sequence[str] = (),
     ) -> Plan:
+        session_fallback = None
+        if self.config.bearer_session_compat and ingress == DIALECT_GEMINI:
+            payload, session_fallback = prepare_gemini(payload, inbound_headers, query_keys)
         _validate_ingress(ingress, payload, translated=ingress != route.dialect)
         if self.config.bearer_session_compat and ingress == DIALECT_OPENAI_CHAT:
             payload, inbound_headers = prepare_chat(payload, inbound_headers)
         provider = route._provider or self.provider(route.provider_name)
-        session_id = _session_id(provider, payload, inbound_headers)
+        session_id = _session_id(provider, payload, inbound_headers, fallback=session_fallback)
         if ingress == route.dialect:
             return self._passthrough(
                 ingress, provider, route, payload, inbound_headers, session_id, client, alt

@@ -48,7 +48,8 @@ def _header_value(headers: Mapping[str, str], name: str) -> str | None:
 
 
 def _session_id(
-    provider: Provider, payload: Mapping[str, Any], inbound: Mapping[str, str]
+    provider: Provider, payload: Mapping[str, Any], inbound: Mapping[str, str],
+    *, fallback: str | None = None,
 ) -> str | None:
     """Select a client-owned identity; never infer one from prompts or credentials."""
     if not provider.session_header:
@@ -83,6 +84,8 @@ def _session_id(
         candidates.append(validate(payload["prompt_cache_key"]))
     if candidates:
         return candidates[0]
+    if fallback is not None:
+        return validate(fallback)
     if provider.session_missing == "reject":
         raise RouterError(400, f"Conversation identity required: send {provider.session_header} "
                           "with the same value on every turn", code="missing_session_id")

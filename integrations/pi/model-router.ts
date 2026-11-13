@@ -18,7 +18,7 @@ const val = (x: any) => x?.value ?? undefined;
 // Pi offers minimal..high unless a level is marked unsupported (null), and
 // xhigh/max only when they are mapped. Offer exactly the efforts the route
 // publishes, so Pi never sends a level the router would have to refuse.
-function thinkingLevels(values: unknown): Record<string, string | null> | undefined {
+function thinkingLevels(values: unknown, canDisable: boolean): Record<string, string | null> | undefined {
   if (!Array.isArray(values)) return undefined;
   const map: Record<string, string | null> = {};
   for (const level of ["minimal", "low", "medium", "high"]) {
@@ -29,6 +29,7 @@ function thinkingLevels(values: unknown): Record<string, string | null> | undefi
   }
   // Without a mapping pi sends nothing for "off" and the upstream keeps thinking.
   if (values.includes("none")) map.off = "none";
+  else if (!canDisable) map.off = null;
   return map;
 }
 
@@ -66,17 +67,15 @@ async function discover(signal?: AbortSignal): Promise<any[]> {
       maxTokens: md.max_tokens ?? val(caps.limits?.max_output_tokens) ?? 16384,
     };
 
-    if (dialect === "openai-chat" || dialect === "gemini") {
-      // llama.cpp publishes none..xhigh, so this also gives pi its off ("none")
-      // and xhigh levels; the router maps them to llama.cpp's native fields.
-      const levels = model.reasoning ? thinkingLevels(val(caps.reasoning?.effort?.values)) : undefined;
-      if (levels) model.thinkingLevelMap = levels;
-    }
-
-    if (dialect === "gemini" && !Array.isArray(val(caps.reasoning?.effort?.values))) {
-      // The router can carry an effort to Gemini exactly only as a native thinking
-      // level, which it knows only for routes that publish their levels. Anything
-      // else is a token-budget estimate that a strict router refuses.
+    const efforts = val(caps.reasoning?.effort?.values);
+    // Apply the same published vocabulary on every protocol. Without a known
+    // vocabulary Pi would invent minimal/low/medium/high, so leave reasoning
+    // controls to the upstream's defaults for those models.
+    const levels = model.reasoning
+      ? thinkingLevels(efforts, val(caps.reasoning?.toggle?.supported) === true)
+      : undefined;
+    if (levels) model.thinkingLevelMap = levels;
+    if (!Array.isArray(efforts) || efforts.length === 0) {
       model.reasoning = false;
     }
 

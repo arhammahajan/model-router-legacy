@@ -1402,6 +1402,7 @@ class DiscoveryRegistry:
             metadata = entry["metadata"]
             limits = metadata["router"]["limits"]
             metadata["muse-code"] = {
+                "name": entry["display_name"],
                 "display_label": entry["display_name"],
                 "is_hidden": False,
                 "limit": {
@@ -1409,6 +1410,20 @@ class DiscoveryRegistry:
                     "output": limits["max_output_tokens"]["value"] or 16384,
                 },
             }
+            reasoning = metadata["router"]["reasoning"]
+            muse = metadata["muse-code"]
+            muse["reasoning"] = reasoning["supported"]["value"] is True
+            efforts = reasoning["effort"]["values"]["value"]
+            if isinstance(efforts, list):
+                muse["variants"] = {
+                    effort: {"reasoningEffort": effort, "selector": {"description": effort}}
+                    for effort in efforts
+                }
+                if efforts:
+                    default = reasoning["effort"]["default"]["value"]
+                    if default not in efforts:
+                        default = "high" if "high" in efforts else efforts[0]
+                    muse["options"] = {"reasoningEffort": default}
         return {
             **payload,
             "data": data,
