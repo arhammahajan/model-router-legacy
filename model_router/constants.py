@@ -110,6 +110,7 @@ _DROP_REQUEST_HEADERS = _HOP_BY_HOP | {
     "x-api-key",
     "api-key",
     "x-goog-api-key",
+    "x-model-router-reasoning-effort",
     # Quota/billing attribution is the operator's choice, never the client's.
     "x-goog-user-project",
     "x-goog-quota-user",

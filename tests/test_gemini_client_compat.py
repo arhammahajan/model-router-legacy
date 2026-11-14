@@ -157,3 +157,64 @@ def test_json_array_streaming_keeps_session_affinity(upstream):
     assert response.status_code == 200, response.text
     assert isinstance(response.json(), list)
     assert upstream.last_request("/v1/chat/completions")["headers"]["x-opencode-session"] == session
+
+
+def effort_config(upstream, model, values, *, enabled=True):
+    raw = config(upstream, enabled=enabled)
+    raw["capabilities"] = {"overrides": {model: {"reasoning": {
+        "supported": True, "effort": {"supported": True, "values": values},
+    }}}}
+    return raw
+
+
+@pytest.mark.parametrize("model,path", [("m-chat", "/v1/chat/completions"),
+                                       ("m-resp", "/v1/responses")])
+@pytest.mark.parametrize("effort", ["low", "high", "xhigh", "max"])
+def test_exact_router_effort_header_reaches_chat_and_responses(upstream, model, path, effort):
+    with router_config(effort_config(upstream, model, ["low", "high", "xhigh", "max"])) as base:
+        response = generate(base, model, headers={
+            "x-goog-api-key": token(), "x-model-router-reasoning-effort": effort,
+        })
+    assert response.status_code == 200, response.text
+    request = upstream.last_request(path)
+    body = request["body"]
+    assert (body["reasoning_effort"] if model == "m-chat" else body["reasoning"]["effort"]) == effort
+    assert "x-model-router-reasoning-effort" not in request["headers"]
+
+
+def test_router_effort_header_becomes_native_gemini_level(upstream):
+    with router_config(effort_config(upstream, "m-gem", ["low", "high"])) as base:
+        response = generate(base, "m-gem", headers={
+            "x-goog-api-key": token(), "x-model-router-reasoning-effort": "high",
+        })
+    assert response.status_code == 200, response.text
+    request = upstream.last_request(NATIVE_PATH)
+    assert request["body"]["generationConfig"]["thinkingConfig"]["thinkingLevel"] == "HIGH"
+    assert "x-model-router-reasoning-effort" not in request["headers"]
+
+
+@pytest.mark.parametrize("body,effort", [
+    (HELLO, "ultra"),
+    ({**HELLO, "generationConfig": []}, "high"),
+    ({**HELLO, "generationConfig": {"thinkingConfig": []}}, "high"),
+    ({**HELLO, "generationConfig": {"thinkingConfig": {"thinkingBudget": 0}}}, "high"),
+])
+def test_router_effort_rejects_unknown_values_and_conflicting_controls(upstream, body, effort):
+    with router_config(effort_config(upstream, "m-chat", ["low", "high", "max"])) as base:
+        response = generate(base, "m-chat", body, headers={
+            "x-goog-api-key": token(), "x-model-router-reasoning-effort": effort,
+        })
+    assert response.status_code == 400, response.text
+    assert not upstream.requests
+
+
+def test_router_effort_header_is_ignored_without_opt_in(upstream):
+    raw = effort_config(upstream, "m-gem", ["low", "high"], enabled=False)
+    for provider in raw["providers"].values():
+        provider["session_missing"] = "omit"
+    with router_config(raw) as base:
+        response = generate(base, "m-gem", headers={"x-model-router-reasoning-effort": "high"})
+    assert response.status_code == 200, response.text
+    request = upstream.last_request(NATIVE_PATH)
+    assert request["body"] == HELLO
+    assert "x-model-router-reasoning-effort" not in request["headers"]

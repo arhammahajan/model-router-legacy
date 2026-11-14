@@ -7,9 +7,52 @@ import re
 from typing import Any, Mapping, Sequence
 
 from .common import RouterError
+from .constants import DIALECT_GEMINI
 
 _SESSION_TOKEN = re.compile(r"router-session-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}")
 _SESSION = re.compile(r"Bearer (" + _SESSION_TOKEN.pattern + r")")
+
+
+def prepare_gemini_effort(
+    payload: dict[str, Any], headers: Mapping[str, str], contract: Mapping[str, Any], target: str,
+) -> tuple[dict[str, Any], str | None]:
+    """Opt-in exact effort carrier for Gemini clients serving non-Gemini models.
+
+    Gemini's thinkingLevel cannot spell xhigh/max. Keep those values out of the
+    Gemini JSON schema and consume this router-only header before forwarding.
+    """
+    effort = next((v for k, v in headers.items()
+                   if k.lower() == "x-model-router-reasoning-effort"), None)
+    if effort is None:
+        return payload, None
+    values = contract.get("reasoning", {}).get("effort", {}).get("values", {}).get("value")
+    if not isinstance(values, list) or effort not in values:
+        raise RouterError(400, "Requested effort is not published for this model",
+                          code="invalid_generation_parameter")
+    raw_config = payload.get("generationConfig")
+    if raw_config is not None and not isinstance(raw_config, dict):
+        raise RouterError(400, "'generationConfig' must be an object",
+                          code="invalid_generation_parameter")
+    config = dict(raw_config or {})
+    raw_thinking = config.get("thinkingConfig")
+    if raw_thinking is not None and not isinstance(raw_thinking, dict):
+        raise RouterError(400, "'thinkingConfig' must be an object",
+                          code="invalid_generation_parameter")
+    thinking = dict(raw_thinking or {})
+    if "thinkingLevel" in thinking or "thinkingBudget" in thinking:
+        raise RouterError(400, "Router effort cannot be combined with Gemini thinking controls",
+                          code="invalid_generation_parameter")
+    if target == DIALECT_GEMINI:
+        if effort == "none":
+            thinking["thinkingBudget"] = 0
+        elif effort in ("minimal", "low", "medium", "high"):
+            thinking["thinkingLevel"] = effort.upper()
+        else:
+            raise RouterError(400, "Native Gemini cannot express this effort",
+                              code="invalid_generation_parameter")
+        config["thinkingConfig"] = thinking
+        return {**payload, "generationConfig": config}, None
+    return payload, effort
 
 
 def prepare_gemini(

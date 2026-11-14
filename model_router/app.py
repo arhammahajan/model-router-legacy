@@ -22,7 +22,7 @@ from .common import (
     _thaw,
 )
 from .config import Provider, Route
-from .client_compat import prepare_chat, prepare_gemini
+from .client_compat import prepare_chat, prepare_gemini, prepare_gemini_effort
 from .count_tokens import count_tokens as _count_tokens
 from .constants import (
     DIALECT_ANTHROPIC,
@@ -191,8 +191,15 @@ class App(DiscoveryRegistry):
         query_keys: Sequence[str] = (),
     ) -> Plan:
         session_fallback = None
+        client_effort = None
         if self.config.bearer_session_compat and ingress == DIALECT_GEMINI:
             payload, session_fallback = prepare_gemini(payload, inbound_headers, query_keys)
+            if any(name.lower() == "x-model-router-reasoning-effort" for name in inbound_headers):
+                effort_contract = self._route_entry(
+                    route if route._provider else replace(route, _provider=self.provider(route.provider_name)),
+                    int(time.time()), self._registry)["metadata"]["router"]
+                payload, client_effort = prepare_gemini_effort(
+                    payload, inbound_headers, effort_contract, route.dialect)
         _validate_ingress(ingress, payload, translated=ingress != route.dialect)
         if self.config.bearer_session_compat and ingress == DIALECT_OPENAI_CHAT:
             payload, inbound_headers = prepare_chat(payload, inbound_headers)
@@ -226,6 +233,9 @@ class App(DiscoveryRegistry):
             translation = gemini.to_chat(
                 {k: v for k, v in payload.items() if k not in ("model", "stream")},
                 route.dialect, stream=bool(payload.get("stream")))
+            if client_effort is not None:
+                translation.params["reasoning_effort"] = client_effort
+                translation.origins["reasoning_effort"] = "x-model-router-reasoning-effort"
             params, losses, native = _prepare_gemini_translation(
                 provider, route, translation, contract)
         else:

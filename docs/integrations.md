@@ -6,6 +6,21 @@
 
 Muse needs no adapter: point it directly at the router's `/v1` base URL. `GET /muse-code/models` and `GET /v1/muse-code/models` serve a Muse-compatible catalog from the same authenticated, cached inventory as `/v1/models`. Entries add `metadata["muse-code"]` with a display label and context/output limits from the router's capability metadata (unknown limits fall back to 128000/16384 tokens), and list every available route regardless of upstream protocol. Generation uses the existing `/v1/responses` endpoint.
 
+## Gemini clients with non-Gemini effort levels
+
+With `[server] bearer_session_compat = true`, Gemini API clients may send
+`x-model-router-reasoning-effort` alongside a normal GenerateContent request.
+This router-only header carries exact route effort names such as `xhigh` and
+`max`, which Gemini's native `thinkingLevel` enum cannot express. Its value must
+appear in that route's published `reasoning.effort.values`; unknown vocabularies
+and conflicting `thinkingBudget`/`thinkingLevel` controls are rejected.
+
+Translated routes use the existing reasoning planner, including strict/lossy
+policy and loss reporting. Native Gemini routes receive `thinkingLevel` or a
+zero budget for `none`. The header is always removed before upstream forwarding;
+without the compatibility opt-in it has no effect. The dots checkout's Gemini
+source fork uses this carrier for T3's separate reasoning-effort control.
+
 ## pi
 
 `integrations/pi/model-router.ts` registers the router's models as a pi provider, discovered at startup and on refresh. Each model uses its upstream's native protocol, so requests pass through untouched.
